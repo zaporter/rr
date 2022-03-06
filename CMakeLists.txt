@@ -14,9 +14,9 @@ endif()
 
 # On single configuration generators, make Debug the default configuration
 if(NOT CMAKE_CONFIGURATION_TYPES)
-  if(NOT CMAKE_BUILD_TYPE)
+    if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Debug" CACHE STRING "Whether to build in `Debug` or `Release` mode." FORCE)
-  endif()
+    endif()
 endif()
 
 enable_testing()
@@ -66,11 +66,11 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${FLAGS_COMMON} -Wstrict-prototypes -std=gnu
 # Define __STDC_FORMAT_MACROS so |#include <inttypes.h>| works as expected.
 include(CheckCXXCompilerFlag)
 CHECK_CXX_COMPILER_FLAG("-std=c++14" SUPPORTS_CXX14)
-if (SUPPORTS_CXX14)
+#if (SUPPORTS_CXX14)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${FLAGS_COMMON} -D__STDC_LIMIT_MACROS -D__STDC_FORMAT_MACROS -std=c++14")
-else()
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${FLAGS_COMMON} -D__STDC_LIMIT_MACROS -D__STDC_FORMAT_MACROS -std=c++11")
-endif()
+  #else()
+  #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${FLAGS_COMMON} -D__STDC_LIMIT_MACROS -D__STDC_FORMAT_MACROS -std=c++11")
+  #endif()
 
 # We support three build types:
 # DEBUG: suitable for debugging rr
@@ -522,6 +522,8 @@ set(RR_SOURCES
   src/VirtualPerfCounterMonitor.cc
   src/util.cc
   src/WaitStatus.cc
+  src/foo.cc
+  src/main.cc
   ${CMAKE_CURRENT_BINARY_DIR}/rr_trace.capnp.c++
   ${BLAKE_ARCH_DIR}/blake2b.c
 )
@@ -552,7 +554,8 @@ else()
   set(CMAKE_INSTALL_INCLUDEDIR "include")
 endif()
 
-add_executable(rr ${RR_SOURCES} src/main.cc)
+#add_executable(rr ${RR_SOURCES} src/main.cc)
+add_library(rr ${RR_SOURCES})
 set_target_properties(rr PROPERTIES ENABLE_EXPORTS true)
 post_build_executable(rr)
 set(RR_BIN rr)
@@ -662,8 +665,9 @@ set(RR_INSTALL_LIBS rrpage rraudit rr_exec_stub)
 if (x86ish)
   set(RR_INSTALL_LIBS rrpreload ${RR_INSTALL_LIBS})
 endif()
-install(TARGETS ${RR_BIN} ${RR_INSTALL_LIBS}
-  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+
+install(TARGETS rr DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS ${RR_INSTALL_LIBS} 
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/rr
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}/rr)
 

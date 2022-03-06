@@ -5,7 +5,6 @@
 
 #include <string>
 #include <vector>
-
 namespace rr {
 
 void assert_prerequisites(bool use_syscall_buffer = false);
@@ -19,6 +18,6 @@ char* saved_argv0();
 // Space available at `saved_argv0` including trailing null bytes.
 size_t saved_argv0_space();
 
+int run(int argc, char* argv[]);
 } // namespace rr
-
 #endif // RR_MAIN_H_
