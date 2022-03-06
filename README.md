@@ -1,6 +1,12 @@
-# Overview
+# Overview of this project
 
-[![Build status](https://badge.buildkite.com/43782b9c8f7c98ed8a9ba1e82c3baeba59783b675fc4d4c9e4.svg?branch=master)](https://buildkite.com/julialang/rr)
+This is a fork of rr which is designed for [librr-rs](https://github.com/zaporter/librr-rs). It will try to stay as close as possible to the original but is designed to be compiled into a dynamic library instead of an executable. 
+
+This is a VERY immature repo. Do not use this for your own projects yet. 
+
+
+
+# Overview of rr
 
 rr is a lightweight tool for recording, replaying and debugging execution of applications (trees of processes and threads).
 Debugging extends gdb with very efficient reverse-execution, which in combination with standard gdb/x86 features like hardware data watchpoints, makes debugging much more fun. More information about the project, including instructions on how to install, run, and build rr, is at [https://rr-project.org](https://rr-project.org). The best technical overview is currently the paper [Engineering Record And Replay For Deployability: Extended Technical Report](https://arxiv.org/pdf/1705.05937.pdf).
