@@ -19,5 +19,7 @@ char* saved_argv0();
 size_t saved_argv0_space();
 
 int run(int argc, char* argv[]);
+void init_random();
+
 } // namespace rr
 #endif // RR_MAIN_H_

@@ -12,19 +12,6 @@
 using namespace std;
 namespace rr {
 
-void force_close_record_session();
-
-class RecordCommand : public Command {
-public:
-  virtual int run(std::vector<std::string>& args) override;
-
-  static RecordCommand* get() { return &singleton; }
-
-protected:
-  RecordCommand(const char* name, const char* help) : Command(name, help) {}
-
-  static RecordCommand singleton;
-};
 struct RecordFlags {
   vector<string> extra_env;
 
@@ -123,6 +110,20 @@ struct RecordFlags {
         stap_sdt(false),
         unmap_vdso(false),
         asan(false) {}
+};
+void force_close_record_session();
+int start_recording(vector<string>& args, RecordFlags& flags);
+
+class RecordCommand : public Command {
+public:
+  virtual int run(std::vector<std::string>& args) override;
+
+  static RecordCommand* get() { return &singleton; }
+
+protected:
+  RecordCommand(const char* name, const char* help) : Command(name, help) {}
+
+  static RecordCommand singleton;
 };
 
 } // namespace rr

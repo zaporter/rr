@@ -647,7 +647,13 @@ int RecordCommand::run(vector<string>& args) {
   RecordFlags flags;
   while (parse_record_arg(args, flags)) {
   }
-
+  return start_recording(args,flags);
+}
+int start_recording(vector<string>& args, RecordFlags& flags) {
+  cout << "Args Record:" <<endl;
+  for(auto arg : args){
+    cout << arg << endl;
+  }
   if (running_under_rr()) {
     switch (flags.nested) {
       case NESTED_IGNORE:
@@ -679,11 +685,11 @@ int RecordCommand::run(vector<string>& args) {
         return 1;
     }
   }
-
-  if (!verify_not_option(args) || args.size() == 0) {
-    print_help(stderr);
-    return 1;
-  }
+ // TODO ZACK: Proper error reporting
+ // if (!Command::verify_not_option(args) || args.size() == 0) {
+ //   RecordCommand::singleton.print_help(stderr);
+ //   return 1;
+//}
 
   assert_prerequisites(flags.use_syscall_buffer);
 
@@ -727,6 +733,7 @@ int RecordCommand::run(vector<string>& args) {
       break;
   }
   return 1;
+
 }
 
 } // namespace rr

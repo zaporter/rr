@@ -113,7 +113,7 @@ void print_usage(FILE* out) {
   exit(EXIT_FAILURE);
 }
 
-static void init_random() {
+void init_random() {
   // Not very good, but good enough for our non-security-sensitive needs.
   int key;
   good_random(&key, sizeof(key));
@@ -235,6 +235,11 @@ int run(int argc, char* argv[]) {
     args.push_back(argv[i]);
   }
 
+  cout << "Args:" <<endl;
+  for(auto arg : args){
+    cout << arg << endl;
+  }
+
   while (parse_global_option(args)) {
   }
 
@@ -265,6 +270,10 @@ int run(int argc, char* argv[]) {
     }
   }
 
+  cout << "Args End main:" <<endl;
+  for(auto arg : args){
+    cout << arg << endl;
+  }
   return command->run(args);
 }
 
