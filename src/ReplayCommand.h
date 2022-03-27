@@ -6,7 +6,9 @@
 #include "Command.h"
 #include "Flags.h"
 #include "GdbServer.h"
+#include "ReplaySession.h"
 #include "core.h"
+#include <memory>
 #include <unistd.h>
 
 namespace rr {
@@ -100,6 +102,7 @@ struct ReplayFlags {
 
 
 int start_replaying(ReplayFlags flags, std::string trace_dir);
+std::unique_ptr<ReplaySession> create_replay_session(std::string trace_dir, ReplayFlags flags);
 } // namespace rr
 
 #endif // RR_REPLAY_COMMAND_H_

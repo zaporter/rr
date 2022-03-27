@@ -14,6 +14,7 @@
 #include "ScopedFd.h"
 #include "ThreadDb.h"
 #include "TraceFrame.h"
+#include "BinConnection.h"
 
 namespace rr {
 
@@ -120,7 +121,7 @@ public:
 
   ReplayTimeline& get_timeline() { return timeline; }
 
-private:
+protected:
   GdbServer(std::unique_ptr<GdbConnection>& dbg, Task* t);
 
   Session& current_session() {

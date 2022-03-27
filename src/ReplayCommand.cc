@@ -270,12 +270,12 @@ static void serve_replay_no_debugger(const string& trace_dir,
                                      const ReplayFlags& flags) {
   ReplaySession::shr_ptr replay_session =
     ReplaySession::create(trace_dir, session_flags(flags));
+  std::cout << "serve_replay_no_debugger" << std::endl;
   uint32_t step_count = 0;
   struct timeval last_dump_time;
   double last_dump_rectime = 0;
   Session::Statistics last_stats;
   gettimeofday(&last_dump_time, NULL);
-
   while (true) {
     RunCommand cmd = RUN_CONTINUE;
     if (flags.singlestep_to_event > 0 &&
@@ -326,7 +326,7 @@ static void serve_replay_no_debugger(const string& trace_dir,
     DEBUG_ASSERT(cmd == RUN_SINGLESTEP ||
                  !result.break_status.singlestep_complete);
   }
-
+  std::cout << "step count: " << step_count << std::endl;
   LOG(info) << "Replayer successfully finished";
 }
 
@@ -379,6 +379,8 @@ static int replay(const string& trace_dir, const ReplayFlags& flags) {
   if (flags.dont_launch_debugger) {
     if (target.event == numeric_limits<decltype(target.event)>::max()) {
       serve_replay_no_debugger(trace_dir, flags);
+    } else if (target.event == 535) {
+      std::cout << "MATHEMATICS SLOW: " << trace_dir << std::endl;
     } else {
       auto session = ReplaySession::create(trace_dir, session_flags(flags));
       GdbServer::ConnectionFlags conn_flags;

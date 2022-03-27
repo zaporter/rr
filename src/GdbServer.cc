@@ -1685,7 +1685,7 @@ static void push_target_remote_cmd(vector<string>& vec, const string& host,
  */
 static unique_ptr<GdbConnection> await_connection(
     Task* t, ScopedFd& listen_fd, const GdbConnection::Features& features) {
-  auto dbg = unique_ptr<GdbConnection>(new GdbConnection(t->tgid(), features));
+  auto dbg = unique_ptr<GdbConnection>(new BinConnection(t->tgid(), features));
   dbg->set_cpu_features(get_cpu_features(t->arch()));
   dbg->await_debugger(listen_fd);
   return dbg;
