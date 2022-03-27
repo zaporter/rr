@@ -523,6 +523,7 @@ set(RR_SOURCES
   src/util.cc
   src/WaitStatus.cc
   src/foo.cc
+  src/BinConnection.cc
   src/main.cc
   ${CMAKE_CURRENT_BINARY_DIR}/rr_trace.capnp.c++
   ${BLAKE_ARCH_DIR}/blake2b.c
