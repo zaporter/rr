@@ -203,7 +203,7 @@ static bool try_grow_map(RecordTask* t, siginfo_t* si) {
 
   {
     AutoRemoteSyscalls remote(t, AutoRemoteSyscalls::DISABLE_MEMORY_PARAMS);
-    remote.infallible_mmap_syscall(
+    remote.infallible_mmap_syscall_if_alive(
         new_start, it->map.start() - new_start, it->map.prot(),
         (it->map.flags() & ~MAP_GROWSDOWN) | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
   }
@@ -328,13 +328,7 @@ bool handle_syscallbuf_breakpoint(RecordTask* t) {
  * The tracee's execution may be advanced, and if so |regs| is updated
  * to the tracee's latest state.
  */
-static void handle_desched_event(RecordTask* t, const siginfo_t* si) {
-  ASSERT(t, t->session().syscallbuf_desched_sig() == si->si_signo && si->si_code == POLL_IN)
-      << "Tracee is using the syscallbuf signal ("
-      << signal_name(t->session().syscallbuf_desched_sig())
-      << ") ??? (siginfo=" << *si << ")\n"
-      << "Try recording with --syscall-buffer-sig=<UNUSED SIGNAL>";
-
+static void handle_desched_event(RecordTask* t) {
   /* If the tracee isn't in the critical section where a desched
    * event is relevant, we can ignore it.  See the long comments
    * in syscall_buffer.c.
@@ -432,6 +426,7 @@ static void handle_desched_event(RecordTask* t, const siginfo_t* si) {
     t->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_UNLIMITED_TICKS);
 
     if (t->status().is_syscall()) {
+      t->apply_syscall_entry_regs();
       if (t->is_arm_desched_event_syscall()) {
         continue;
       }
@@ -656,8 +651,9 @@ SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
      * those we *do not* want to (and cannot, most of the time)
      * step the tracee out of the syscallbuf code before
      * attempting to deliver the signal. */
-    if (t->session().syscallbuf_desched_sig() == si->si_signo) {
-      handle_desched_event(t, si);
+    if (t->session().syscallbuf_desched_sig() == si->si_signo &&
+        si->si_code == POLL_IN) {
+      handle_desched_event(t);
       return SIGNAL_HANDLED;
     }
 

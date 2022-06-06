@@ -25,6 +25,7 @@
 #include "TraceStream.h"
 #include "core.h"
 #include "kernel_abi.h"
+#include "log.h"
 #include "remote_code_ptr.h"
 #include "util.h"
 
@@ -32,6 +33,7 @@ namespace rr {
 
 class AutoRemoteSyscalls;
 class MonitoredSharedMemory;
+class RecordSession;
 class RecordTask;
 class Session;
 class Task;
@@ -257,7 +259,7 @@ public:
             std::shared_ptr<MonitoredSharedMemory>&& monitored = nullptr);
     ~Mapping();
     Mapping(const Mapping&);
-    Mapping() = default;
+    Mapping() : local_addr(nullptr), flags(0) {}
     const Mapping& operator=(const Mapping& other) {
       this->~Mapping();
       new (this) Mapping(other);
@@ -668,17 +670,12 @@ public:
    * use.
    */
   static remote_ptr<void> rr_page_start() { return RR_PAGE_ADDR; }
-  /**
-   * This might not be the length of an actual system page, but we allocate
-   * at least this much space.
-   */
-  static uint32_t rr_page_size() { return 4096; }
   static remote_ptr<void> rr_page_end() {
-    return rr_page_start() + rr_page_size();
+    return rr_page_start() + PRELOAD_LIBRARY_PAGE_SIZE;
   }
 
   static remote_ptr<void> preload_thread_locals_start() {
-    return rr_page_start() + rr_page_size();
+    return rr_page_start() + PRELOAD_LIBRARY_PAGE_SIZE;
   }
   static uint32_t preload_thread_locals_size() {
     return PRELOAD_THREAD_LOCALS_SIZE;
@@ -774,6 +771,7 @@ public:
 
   static uint32_t chaos_mode_min_stack_size() { return 8 * 1024 * 1024; }
 
+  /* Returns null if we should not override the memory allocation */
   remote_ptr<void> chaos_mode_find_free_memory(RecordTask* t, size_t len, remote_ptr<void> hint);
   remote_ptr<void> find_free_memory(
       size_t len, remote_ptr<void> after = remote_ptr<void>());
@@ -847,7 +845,7 @@ public:
    */
   void fd_tables_changed();
 
-  static MemoryRange get_global_exclusion_range();
+  static MemoryRange get_global_exclusion_range(const RecordSession* session);
 
 private:
   struct Breakpoint;

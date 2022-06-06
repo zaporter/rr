@@ -4,10 +4,16 @@
 #define RR_LOG_H
 
 #include <features.h>
+#include <signal.h>
 
 #include <iostream>
 #include <type_traits>
 #include <vector>
+
+/**
+ * Print siginfo on ostream.
+ */
+std::ostream& operator<<(std::ostream& stream, const siginfo_t& siginfo);
 
 namespace rr {
 
@@ -167,6 +173,9 @@ const EmergencyDebugOstream& operator<<(const EmergencyDebugOstream& stream,
 #ifndef __has_builtin
 #define __has_builtin(x) 0
 #endif
+#ifndef __GNUC_PREREQ
+#define __GNUC_PREREQ(maj, min) 0
+#endif
 #if __has_builtin(__builtin_expect) || __GNUC_PREREQ(4, 0)
 #define RR_UNLIKELY(EXPR) __builtin_expect((bool)(EXPR), false)
 #else
@@ -187,6 +196,25 @@ const EmergencyDebugOstream& operator<<(const EmergencyDebugOstream& stream,
                             __FUNCTION__, #_cond) _actions;                    \
     }                                                                          \
   } while (0)
+
+/* use of assert() causes "unused variable" warnings in non-DEBUG builds
+ * when a variable is only used in an assertion. DEBUG_ASSERT fixes that
+ * problem. Use DEBUG_ASSERT instead of assert().
+ * This also gives us a stack trace if the assertion fails.
+ */
+#ifdef DEBUG
+#define DEBUG_ASSERT(cond) \
+  do {                     \
+    if (!(cond)) {         \
+      FATAL() << #cond;    \
+    }                      \
+  } while(0)
+#else
+#define DEBUG_ASSERT(cond)                                                     \
+  do {                                                                         \
+    size_t s __attribute__((unused)) = sizeof(cond);                           \
+  } while (0)
+#endif
 
 /**
  * Ensure that |_v| is streamed in hex format.

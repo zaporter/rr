@@ -63,6 +63,7 @@ static CpuMicroarch compute_cpu_microarch() {
     case 0x50670:
       return IntelSilvermont;
     case 0x506f0:
+    case 0x706a0:
       return IntelGoldmont;
     case 0x706e0:
     case 0x606a0:
@@ -79,6 +80,7 @@ static CpuMicroarch compute_cpu_microarch() {
     case 0xa0670:
       return IntelRocketlake;
     case 0x90670:
+    case 0x906a0:
       return IntelAlderlake;
     case 0x30f00:
       return AMDF15R30;
@@ -91,6 +93,7 @@ static CpuMicroarch compute_cpu_microarch() {
     case 0x60f00: // Renoir (Zen 2) (UNTESTED)
     case 0x70f10: // Matisse (Zen 2) (UNTESTED)
     case 0x60f80: // Lucienne
+    case 0x90f00: // Van Gogh (Zen 2)
       if (ext_family == 8 || ext_family == 0xa) {
         return AMDZen;
       } else if (ext_family == 3) {
@@ -107,16 +110,21 @@ static CpuMicroarch compute_cpu_microarch() {
   }
 
   if (!strncmp(vendor, "AuthenticAMD", sizeof(vendor))) {
-    CLEAN_FATAL() << "AMD CPU type " << HEX(cpu_type) << " unknown";
+    CLEAN_FATAL() << "AMD CPU type " << HEX(cpu_type) <<
+                     " (ext family " << HEX(ext_family) << ") unknown";
   } else {
     CLEAN_FATAL() << "Intel CPU type " << HEX(cpu_type) << " unknown";
   }
   return UnknownCpu; // not reached
 }
 
-static void check_for_kvm_in_txcp_bug() {
+static std::vector<CpuMicroarch> compute_cpu_microarchs() {
+  return { compute_cpu_microarch() };
+}
+
+static void check_for_kvm_in_txcp_bug(const perf_event_attrs &perf_attr) {
   int64_t count = 0;
-  struct perf_event_attr attr = rr::ticks_attr;
+  struct perf_event_attr attr = perf_attr.ticks;
   attr.config |= IN_TXCP;
   attr.sample_period = 0;
   bool disabled_txcp;
@@ -135,9 +143,9 @@ static void check_for_kvm_in_txcp_bug() {
              << " count=" << count;
 }
 
-static void check_for_xen_pmi_bug() {
+static void check_for_xen_pmi_bug(const perf_event_attrs &perf_attr) {
   int32_t count = -1;
-  struct perf_event_attr attr = rr::ticks_attr;
+  struct perf_event_attr attr = perf_attr.ticks;
   attr.sample_period = NUM_BRANCHES - 1;
   ScopedFd fd = start_counter(0, -1, &attr);
   if (fd.is_open()) {
@@ -316,7 +324,10 @@ static void check_for_freeze_on_smi() {
   }
 
   char freeze_on_smi = 0;
-  read(fd, &freeze_on_smi, 1);
+  ssize_t ret = read(fd, &freeze_on_smi, 1);
+  if (ret != 1) {
+    FATAL() << "Can't read freeze_on_smi";
+  }
   if (freeze_on_smi == 0) {
     LOG(warn) << "Failed to read freeze_on_smi";
   } else if (freeze_on_smi == '1') {
@@ -325,20 +336,26 @@ static void check_for_freeze_on_smi() {
     LOG(warn) << "freeze_on_smi is not set";
     if (!Flags::get().suppress_environment_warnings) {
       fprintf(stderr,
-              "Freezing performance counters on SMIs should be turned on for maximum rr\n"
-              "reliability on Comet Lake and later CPUs. Consider putting\n"
-              "'w /sys/devices/cpu/freeze_on_smi - - - - 1' in /etc/tmpfiles.d/10-rr.conf\n"
-              "See 'man 5 sysfs', 'man 5 tmpfiles.d' (systemd systems)\n");
+              "Freezing performance counters on SMIs should be enabled for maximum rr\n"
+              "reliability on Comet Lake and later CPUs. To manually enable this setting, run\n"
+              "\techo 1 | sudo tee /sys/devices/cpu/freeze_on_smi\n"
+              "On systemd systems, consider putting\n"
+              "'w /sys/devices/cpu/freeze_on_smi - - - - 1' into /etc/tmpfiles.d/10-rr.conf\n"
+              "to automatically apply this setting on every reboot.\n"
+              "See 'man 5 sysfs', 'man 5 tmpfiles.d'.\n"
+              "If you are seeing this message, the setting has not been enabled.\n");
     }
   } else {
     LOG(warn) << "Unrecognized freeze_on_smi value " << freeze_on_smi;
   }
 }
 
-static void check_for_arch_bugs(CpuMicroarch uarch) {
+static void check_for_arch_bugs(perf_event_attrs &perf_attr) {
+  DEBUG_ASSERT(rr::perf_attrs.size() == 1);
+  CpuMicroarch uarch = (CpuMicroarch)perf_attr.bug_flags;
   if (uarch >= FirstIntel && uarch <= LastIntel) {
-    check_for_kvm_in_txcp_bug();
-    check_for_xen_pmi_bug();
+    check_for_kvm_in_txcp_bug(perf_attr);
+    check_for_xen_pmi_bug(perf_attr);
   }
   if (uarch >= IntelCometlake && uarch <= LastIntel) {
     check_for_freeze_on_smi();
@@ -348,10 +365,19 @@ static void check_for_arch_bugs(CpuMicroarch uarch) {
   }
 }
 
-static bool always_recreate_counters() {
+static void post_init_pmu_uarchs(std::vector<PmuConfig> &pmu_uarchs)
+{
+  if (pmu_uarchs.size() != 1) {
+    CLEAN_FATAL() << "rr only support a single PMU on x86, "
+                  << pmu_uarchs.size() << " specified.";
+  }
+}
+
+static bool always_recreate_counters(const perf_event_attrs &perf_attr) {
   // When we have the KVM IN_TXCP bug, reenabling the TXCP counter after
   // disabling it does not work.
-  return has_ioc_period_bug || has_kvm_in_txcp_bug;
+  DEBUG_ASSERT(perf_attr.checked);
+  return perf_attr.has_ioc_period_bug || has_kvm_in_txcp_bug;
 }
 
 static void arch_check_restricted_counter() {
@@ -368,8 +394,9 @@ static void arch_check_restricted_counter() {
 
 template <typename Arch>
 void PerfCounters::reset_arch_extras() {
+  DEBUG_ASSERT(rr::perf_attrs.size() == 1);
   if (supports_txcp) {
-    struct perf_event_attr attr = rr::ticks_attr;
+    struct perf_event_attr attr = rr::perf_attrs[0].ticks;
     if (has_kvm_in_txcp_bug) {
       // IN_TXCP isn't going to work reliably. Assume that HLE/RTM are not
       // used,

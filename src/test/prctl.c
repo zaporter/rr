@@ -62,6 +62,13 @@ int main(void) {
   test_assert(0 == prctl(PR_SET_MM, PR_SET_MM_MAP_SIZE, &size, 0, 0));
   test_assert(size != 0);
 
+  // On a kernel without PR_SET_VMA, this will return EINVAL.
+  // On a kernel with it, it should return EBADF, because
+  // the rr page is not an anonymous mapping.
+  ssize_t page_size = sysconf(_SC_PAGE_SIZE);
+  test_assert(-1 == prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, 0x7000000, page_size, "foo") &&
+              (errno == EINVAL || errno == EBADF));
+
   atomic_puts("EXIT-SUCCESS");
   return 0;
 }

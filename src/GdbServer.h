@@ -12,7 +12,9 @@
 #include "ReplaySession.h"
 #include "ReplayTimeline.h"
 #include "ScopedFd.h"
+#ifdef PROC_SERVICE_H
 #include "ThreadDb.h"
+#endif
 #include "TraceFrame.h"
 #include "BinConnection.h"
 
@@ -71,6 +73,7 @@ public:
         in_debuggee_end_state(false),
         stop_replaying_to_target(false),
         interrupt_pending(false),
+        exit_sigkill_pending(false),
         timeline(std::move(session)),
         emergency_debug_session(nullptr) {
     memset(&stop_siginfo, 0, sizeof(stop_siginfo));
@@ -143,7 +146,7 @@ protected:
    */
   void dispatch_debugger_request(Session& session, const GdbRequest& req,
                                  ReportState state);
-  bool at_target();
+  bool at_target(ReplayResult& result);
   void activate_debugger();
   void restart_session(const GdbRequest& req);
   GdbRequest process_debugger_requests(ReportState state = REPORT_NORMAL);
@@ -220,7 +223,9 @@ protected:
   // support switching gdb between debuggee processes.
   ThreadGroupUid debuggee_tguid;
   // ThreadDb for debuggee ThreadGroup
+#ifdef PROC_SERVICE_H
   std::unique_ptr<ThreadDb> thread_db;
+#endif
   // The TaskUid of the last continued task.
   TaskUid last_continue_tuid;
   // The TaskUid of the last queried task.
@@ -234,6 +239,8 @@ protected:
   // True when a DREQ_INTERRUPT has been received but not handled, or when
   // we've restarted and want the first continue to be interrupted immediately.
   bool interrupt_pending;
+  // True when a user has run to exit before attaching the debugger.
+  bool exit_sigkill_pending;
 
   ReplayTimeline timeline;
   Session* emergency_debug_session;

@@ -46,7 +46,6 @@
 #include "ScopedFd.h"
 #include "StdioMonitor.h"
 #include "StringVectorToCharArray.h"
-#include "ThreadDb.h"
 #include "cpp_supplement.h"
 #include "fast_forward.h"
 #include "kernel_abi.h"
@@ -72,7 +71,7 @@ Task::Task(Session& session, pid_t _tid, pid_t _rec_tid, uint32_t serial,
       desched_fd_child(-1),
       // This will be initialized when the syscall buffer is.
       cloned_file_data_fd_child(-1),
-      hpc(_tid, session.ticks_semantics()),
+      hpc(_tid, session.cpu_binding(), session.ticks_semantics()),
       tid(_tid),
       rec_tid(_rec_tid > 0 ? _rec_tid : _tid),
       own_namespace_rec_tid(_rec_tid > 0 ? _rec_tid: _tid),
@@ -112,13 +111,15 @@ void Task::detach() {
 }
 
 void Task::reenable_cpuid_tsc() {
-  AutoRemoteSyscalls remote(this);
-  if (session().has_cpuid_faulting()) {
-    remote.infallible_syscall(syscall_number_for_arch_prctl(arch()),
-                          ARCH_SET_CPUID, 1);
+  if (is_x86ish(arch())) {
+    AutoRemoteSyscalls remote(this);
+    if (session().has_cpuid_faulting()) {
+      remote.infallible_syscall(syscall_number_for_arch_prctl(arch()),
+                            ARCH_SET_CPUID, 1);
+    }
+    remote.infallible_syscall(syscall_number_for_prctl(arch()),
+                          PR_SET_TSC, PR_TSC_ENABLE);
   }
-  remote.infallible_syscall(syscall_number_for_prctl(arch()),
-                        PR_SET_TSC, PR_TSC_ENABLE);
 }
 
 void Task::wait_exit() {
@@ -427,18 +428,15 @@ void Task::did_kill()
  * Must be idempotent.
  */
 void Task::close_buffers_for(AutoRemoteSyscalls& remote, Task* other, bool really_close) {
-  auto arch = remote.task()->arch();
   if (other->desched_fd_child >= 0) {
     if (session().is_recording() && really_close) {
-      remote.infallible_syscall(syscall_number_for_close(arch),
-                                other->desched_fd_child);
+      remote.infallible_close_syscall_if_alive(other->desched_fd_child);
     }
     fds->did_close(other->desched_fd_child);
   }
   if (other->cloned_file_data_fd_child >= 0) {
     if (really_close) {
-      remote.infallible_syscall(syscall_number_for_close(arch),
-                                other->cloned_file_data_fd_child);
+      remote.infallible_close_syscall_if_alive(other->cloned_file_data_fd_child);
     }
     fds->did_close(other->cloned_file_data_fd_child);
   }
@@ -852,6 +850,7 @@ void Task::enter_syscall() {
     static_cast<RecordTask*>(this)->stash_sig();
   }
   apply_syscall_entry_regs();
+  canonicalize_regs(arch());
 }
 
 bool Task::exit_syscall() {
@@ -943,6 +942,7 @@ void Task::post_exec(const string& exe_file, const string& original_exe_file) {
     }
   }
   if (stopped_task_in_address_space) {
+    LOG(warn) << "Unmapping buffers using tid " << stopped_task_in_address_space->tid;
     AutoRemoteSyscalls remote(stopped_task_in_address_space);
     unmap_buffers_for(remote, this, syscallbuf_child);
   } else if (other_task_in_address_space) {
@@ -972,6 +972,7 @@ void Task::post_exec(const string& exe_file, const string& original_exe_file) {
   cloned_file_data_fd_child = -1;
   desched_fd_child = -1;
   preload_globals = nullptr;
+  rseq_state = nullptr;
   thread_group()->execed = true;
 
   thread_areas_.clear();
@@ -1050,7 +1051,7 @@ const ExtraRegisters* Task::extra_regs_fallible() {
 
       extra_registers.format_ = ExtraRegisters::XSAVE;
       extra_registers.data_.resize(sizeof(user_fpxregs_struct));
-      if (fallible_ptrace(PTRACE_GETFPXREGS, nullptr, extra_registers.data_.data())) {
+      if (fallible_ptrace(X86Arch::PTRACE_GETFPXREGS, nullptr, extra_registers.data_.data())) {
         return nullptr;
       }
 #elif defined(__x86_64__)
@@ -1527,7 +1528,7 @@ void Task::set_extra_regs(const ExtraRegisters& regs) {
 #if defined(__i386__)
         ASSERT(this,
                extra_registers.data_.size() == sizeof(user_fpxregs_struct));
-        ptrace_if_alive(PTRACE_SETFPXREGS, nullptr,
+        ptrace_if_alive(X86Arch::PTRACE_SETFPXREGS, nullptr,
                         extra_registers.data_.data());
 #elif defined(__x86_64__)
         ASSERT(this,
@@ -2022,6 +2023,12 @@ void Task::did_waitpid(WaitStatus status) {
   LOG(debug) << "  (refreshing register cache)";
   Ticks more_ticks = 0;
 
+  bool was_stopped = is_stopped;
+  // Mark as stopped now. If we fail one of the ticks assertions below,
+  // the test-monitor (or user) might want to attach the emergency debugger,
+  // which needs to know that the tracee is stopped.
+  is_stopped = true;
+
   if (status.reaped()) {
     was_reaped = true;
     if (handled_ptrace_exit_event) {
@@ -2031,7 +2038,6 @@ void Task::did_waitpid(WaitStatus status) {
       // its thread group. This has now reaped the task, so all we need to do
       // here is get out quickly and the higher-level function should go ahead
       // and delete us.
-      is_stopped = true;
       wait_status = status;
       return;
     }
@@ -2055,7 +2061,7 @@ void Task::did_waitpid(WaitStatus status) {
     // In fact if we didn't start the thread, we may not have flushed dirty
     // registers but still received a PTRACE_EVENT_EXIT, in which case the
     // task's register values are not what they should be.
-    if (!is_stopped && !registers_dirty) {
+    if (!was_stopped && !registers_dirty) {
       LOG(debug) << "Requesting registers from tracee " << tid;
       NativeArch::user_regs_struct ptrace_regs;
 
@@ -2100,7 +2106,6 @@ void Task::did_waitpid(WaitStatus status) {
     }
   }
 
-  is_stopped = true;
   wait_status = status;
   // We stop counting here because there may be things we want to do to the
   // tracee that would otherwise generate ticks.
@@ -2593,7 +2598,7 @@ long Task::stored_record_size(
 }
 
 long Task::fallible_ptrace(int request, remote_ptr<void> addr, void* data) {
-  return ptrace(__ptrace_request(request), tid, addr, data);
+  return ptrace(_ptrace_request(request), tid, addr, data);
 }
 
 bool Task::open_mem_fd() {
@@ -2635,9 +2640,14 @@ bool Task::open_mem_fd() {
     AutoRestoreMem remote_path(remote, mem, sizeof(mem));
     int remote_mem_fd = remote.syscall(syscall_number_for_openat(arch()),
                         remote_mem_dir_fd, remote_path.get(), O_RDWR);
+    if (remote_mem_fd < 0) {
+      LOG(info) << "Can't retrieve mem fd for " << tid
+        << "; couldn't open /proc/...mem; errno=" << errno_name(-remote_mem_fd);
+      return false;
+    }
     fd = remote.retrieve_fd(remote_mem_fd);
-    remote.syscall(syscall_number_for_close(arch()), remote_mem_fd);
-    remote.syscall(syscall_number_for_close(arch()), remote_mem_dir_fd);
+    remote.infallible_close_syscall_if_alive(remote_mem_fd);
+    remote.infallible_close_syscall_if_alive(remote_mem_dir_fd);
   }
 
   if (!fd.is_open()) {
@@ -2660,6 +2670,9 @@ KernelMapping Task::init_syscall_buffer(AutoRemoteSyscalls& remote,
   sprintf(name, "syscallbuf.%d", rec_tid);
   KernelMapping km =
       Session::create_shared_mmap(remote, syscallbuf_size, map_hint, name);
+  if (!km.size()) {
+    return km;
+  }
   auto& m = remote.task()->vm()->mapping_of(km.start());
   remote.task()->vm()->mapping_flags_of(km.start()) |=
       AddressSpace::Mapping::IS_SYSCALLBUF;
@@ -2867,14 +2880,29 @@ static ssize_t safe_pwrite64(Task* t, const void* buf, ssize_t buf_size,
 
   AutoRemoteSyscalls remote(t);
   int mprotect_syscallno = syscall_number_for_mprotect(t->arch());
+  bool failed_access = false;
   for (auto& m : mappings_to_fix) {
-    remote.infallible_syscall(mprotect_syscallno, m.start(), m.size(),
-                              m.prot() | PROT_WRITE);
+    long ret = remote.syscall(mprotect_syscallno, m.start(), m.size(), m.prot() | PROT_WRITE);
+    if ((int)ret == -EACCES) {
+      // We could be trying to write to a read-only shared file. In that case we should
+      // report the error without dying.
+      failed_access = true;
+    } else {
+      remote.check_syscall_result(ret, mprotect_syscallno, false);
+    }
   }
-  ssize_t nwritten = pwrite_all_fallible(t->vm()->mem_fd(), buf, buf_size, addr.as_int());
+  ssize_t nwritten;
+  if (failed_access) {
+    nwritten = -1;
+  } else {
+    nwritten = pwrite_all_fallible(t->vm()->mem_fd(), buf, buf_size, addr.as_int());
+  }
   for (auto& m : mappings_to_fix) {
     remote.infallible_syscall(mprotect_syscallno, m.start(), m.size(),
                               m.prot());
+  }
+  if (failed_access) {
+    errno = EACCES;
   }
   return nwritten;
 }
@@ -3063,7 +3091,7 @@ bool Task::clone_syscall_is_complete(pid_t* new_pid,
 
 template <typename Arch> static void do_preload_init_arch(Task* t) {
   auto params = t->read_mem(
-      remote_ptr<rrcall_init_preload_params<Arch>>(t->regs().arg1()));
+      remote_ptr<rrcall_init_preload_params<Arch>>(t->regs().orig_arg1()));
 
   for (Task* tt : t->vm()->task_set()) {
     tt->preload_globals = params.globals.rptr();
@@ -3151,7 +3179,7 @@ static void spawned_child_fatal_error(const ScopedFd& err_fd,
   _exit(1);
 }
 
-static void disable_tsc(int err_fd) {
+static void disable_tsc(const ScopedFd& err_fd) {
   /* Trap to the rr process if a 'rdtsc' instruction is issued.
    * That allows rr to record the tsc and replay it
    * deterministically. */
@@ -3160,12 +3188,12 @@ static void disable_tsc(int err_fd) {
   }
 }
 
-template <typename Arch> void set_up_process_arch(int err_fd);
-template <> void set_up_process_arch<X86Arch>(int err_fd) { disable_tsc(err_fd); }
-template <> void set_up_process_arch<X64Arch>(int err_fd) { disable_tsc(err_fd); }
-template <> void set_up_process_arch<ARM64Arch>(int) {}
+template <typename Arch> void set_up_process_arch(const ScopedFd&);
+template <> void set_up_process_arch<X86Arch>(const ScopedFd& err_fd) { disable_tsc(err_fd); }
+template <> void set_up_process_arch<X64Arch>(const ScopedFd& err_fd) { disable_tsc(err_fd); }
+template <> void set_up_process_arch<ARM64Arch>(const ScopedFd&) {}
 
-void set_up_process_arch(SupportedArch arch, int err_fd) {
+void set_up_process_arch(SupportedArch arch, const ScopedFd& err_fd) {
   RR_ARCH_FUNCTION(set_up_process_arch, arch, err_fd);
 }
 
@@ -3178,6 +3206,26 @@ static void set_up_process(Session& session, const ScopedFd& err_fd,
                            const ScopedFd& sock_fd, int sock_fd_number) {
   /* TODO tracees can probably undo some of the setup below
    * ... */
+
+  struct NativeArch::cap_header header = {.version =
+                                              _LINUX_CAPABILITY_VERSION_3,
+                                          .pid = 0 };
+  struct NativeArch::cap_data caps[2];
+  if (syscall(NativeArch::capget, &header, &caps) != 0) {
+    spawned_child_fatal_error(err_fd, "Failed to read capabilities");
+  }
+  uint32_t perfmon_mask = 1 << (CAP_PERFMON - 32);
+  if (caps[1].permitted & perfmon_mask) {
+    // Try to pass CAP_PERFMON into our tracees.
+    caps[1].inheritable |= perfmon_mask;
+    // Ignore any failures here. Capabilities are super complex and I'm not
+    // sure this can be trusted to succeed.
+    if (syscall(NativeArch::capset, &header, &caps) == 0) {
+      // Install CAP_PERFMON as an ambient capabilities.
+      // This prctl was only added in 4.3. Ignore failures.
+      prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_PERFMON, 0, 0);
+    }
+  }
 
   /* CLOEXEC so that the original fd here will be closed by the exec that's
    * about to happen.
@@ -3258,7 +3306,7 @@ static SeccompFilter<struct sock_filter> create_seccomp_filter() {
  * things go wrong because we have no ptracer and the seccomp filter demands
  * one.
  */
-static void set_up_seccomp_filter(const struct sock_fprog& prog, int err_fd) {
+static void set_up_seccomp_filter(const struct sock_fprog& prog, const ScopedFd& err_fd) {
   /* Note: the filter is installed only for record. This call
    * will be emulated (not passed to the kernel) in the replay. */
   if (0 > prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, (uintptr_t)&prog, 0, 0)) {
@@ -3330,11 +3378,11 @@ long Task::ptrace_seize(pid_t tid, Session& session) {
   }
 
   long ret =
-      ptrace((__ptrace_request)PTRACE_SEIZE, tid, nullptr, (void*)(options | PTRACE_O_EXITKILL));
+      ptrace((_ptrace_request)PTRACE_SEIZE, tid, nullptr, (void*)(options | PTRACE_O_EXITKILL));
   if (ret < 0 && errno == EINVAL) {
     // PTRACE_O_EXITKILL was added in kernel 3.8, and we only need
     // it for more robust cleanup, so tolerate not having it.
-    ret = ptrace((__ptrace_request)PTRACE_SEIZE, tid, nullptr, (void*)options);
+    ret = ptrace((_ptrace_request)PTRACE_SEIZE, tid, nullptr, (void*)options);
   }
   return ret;
 }
@@ -3481,14 +3529,17 @@ static void create_mapping(Task *t, AutoRemoteSyscalls &remote, const KernelMapp
   dev_t device = KernelMapping::NO_DEVICE;
   ino_t inode = KernelMapping::NO_INODE;
   if (km.is_real_device() && !file_was_deleted(km.fsname())) {
-    struct stat real_file; string real_file_name;
+    struct stat real_file;
+    string real_file_name;
     remote.finish_direct_mmap(km.start(), km.size(), km.prot(), km.flags(),
-      km.fsname(), O_RDONLY, km.file_offset_bytes()/page_size(),
+      km.fsname(), O_RDONLY, km.file_offset_bytes(),
       real_file, real_file_name);
   } else {
-    remote.infallible_mmap_syscall(km.start(), km.size(), km.prot(),
-                                  km.flags() | MAP_FIXED | MAP_ANONYMOUS, -1,
-                                  0);
+    auto ret = remote.infallible_mmap_syscall_if_alive(km.start(), km.size(), km.prot(),
+                                                       km.flags() | MAP_FIXED | MAP_ANONYMOUS, -1,
+                                                       0);
+    ASSERT(t, ret || t->vm()->task_set().size() == t->thread_group()->task_set().size())
+      << "Not handling shared address spaces where one threadgroup unexpectedly dies";
   }
   t->vm()->map(t, km.start(), km.size(), km.prot(), km.flags(), km.file_offset_bytes(),
                real_file_name, device, inode, nullptr, &km);
@@ -3667,27 +3718,31 @@ void Task::dup_from(Task *other) {
       }
       int remote_fd_flags = remote_other.infallible_syscall(
         syscall_number_for_fcntl(this->arch()), fd, F_GETFD);
-      int remote_fd = remote_this.send_fd(here);
-      if (remote_fd != fd) {
-        remote_this.infallible_syscall(syscall_number_for_dup2(this->arch()), remote_fd, fd);
-        remote_this.infallible_syscall(syscall_number_for_close(this->arch()), remote_fd);
+      int remote_fd = remote_this.infallible_send_fd_if_alive(here);
+      if (remote_fd >= 0) {
+        if (remote_fd != fd) {
+          remote_this.infallible_syscall(syscall_number_for_dup3(this->arch()), remote_fd, fd, 0);
+          remote_this.infallible_close_syscall_if_alive(remote_fd);
+        }
+        remote_other.infallible_syscall(
+          syscall_number_for_fcntl(this->arch()),
+          fd, F_SETFD, remote_fd_flags);
       }
-      remote_other.infallible_syscall(
-        syscall_number_for_fcntl(this->arch()),
-        fd, F_SETFD, remote_fd_flags);
     }
     string path = ".";
     AutoRestoreMem child_path(remote_other, path.c_str());
-    long child_fd =
-      remote_other.syscall(syscall_number_for_openat(other->arch()), AT_FDCWD,
-                     child_path.get(), O_RDONLY);
-    ASSERT(other, child_fd != -1);
     {
+      long child_fd =
+        remote_other.syscall(syscall_number_for_openat(other->arch()), AT_FDCWD,
+                       child_path.get(), O_RDONLY);
+      ASSERT(other, child_fd != -1);
       ScopedFd fd = remote_other.retrieve_fd(child_fd);
-      remote_other.syscall(syscall_number_for_close(other->arch()), child_fd);
-      child_fd = remote_this.send_fd(fd);
-      remote_this.syscall(syscall_number_for_fchdir(this->arch()), child_fd);
-      remote_this.syscall(syscall_number_for_close(this->arch()), child_fd);
+      remote_other.infallible_close_syscall_if_alive(child_fd);
+      child_fd = remote_this.infallible_send_fd_if_alive(fd);
+      if (child_fd >= 0) {
+        remote_this.syscall(syscall_number_for_fchdir(this->arch()), child_fd);
+        remote_this.infallible_close_syscall_if_alive(child_fd);
+      }
     }
 
     // Copy rlimits
@@ -3892,12 +3947,26 @@ void Task::move_to_signal_stop()
 
 bool Task::should_apply_rseq_abort(EventType event_type, remote_code_ptr* new_ip,
                                    bool* invalid_rseq_cs) {
-  if (!rseq_state) {
+  /* Syscallbuf flushes don't trigger rseq aborts ---
+     whatever triggered the syscallbuf flush might */
+  if (!rseq_state || event_type == EV_SYSCALLBUF_FLUSH) {
     return false;
   }
-  // We're relying on the fact that rseq_t is the same across architectures
-  auto rseq = read_mem(rseq_state->ptr.cast<typename NativeArch::rseq_t>());
-  if (!rseq.rseq_cs) {
+  // We're relying on the fact that rseq_t is the same across architectures.
+  // These reads might fail if the task is dead and gone.
+  bool ok = true;
+  auto rseq = read_mem(rseq_state->ptr.cast<typename NativeArch::rseq_t>(), &ok);
+  if (!ok || !rseq.rseq_cs) {
+    return false;
+  }
+  auto rseq_cs = read_mem(remote_ptr<typename NativeArch::rseq_cs>(rseq.rseq_cs), &ok);
+  if (!ok || rseq_cs.version ||
+      rseq_cs.start_ip + rseq_cs.post_commit_offset < rseq_cs.start_ip ||
+      rseq_cs.abort_ip - rseq_cs.start_ip < rseq_cs.post_commit_offset) {
+    *invalid_rseq_cs = true;
+    return false;
+  }
+  if (ip().register_value() - rseq_cs.start_ip >= rseq_cs.post_commit_offset) {
     return false;
   }
   uint32_t flag;
@@ -3909,27 +3978,19 @@ bool Task::should_apply_rseq_abort(EventType event_type, remote_code_ptr* new_ip
       flag = 1 << RR_RSEQ_CS_FLAG_NO_RESTART_ON_SIGNAL_BIT;
       break;
     default:
+      /* A system call inside the rseq region should SIGSEGV but we don't emulate that yet */
       ASSERT(this, false) << "Unsupported event type";
       return false;
   }
-  auto rseq_cs = read_mem(remote_ptr<typename NativeArch::rseq_cs>(rseq.rseq_cs));
   if ((rseq.flags | rseq_cs.flags) & flag) {
     return false;
   }
-  if (rseq_cs.version ||
-      rseq_cs.start_ip + rseq_cs.post_commit_offset < rseq_cs.start_ip ||
-      rseq_cs.abort_ip - rseq_cs.start_ip < rseq_cs.post_commit_offset) {
+  uint32_t sig = read_mem(remote_ptr<uint32_t>(rseq_cs.abort_ip - 4), &ok);
+  if (!ok || sig != rseq_state->abort_prefix_signature) {
     *invalid_rseq_cs = true;
     return false;
   }
-  uint32_t sig = read_mem(remote_ptr<uint32_t>(rseq_cs.abort_ip - 4));
-  if (sig != rseq_state->abort_prefix_signature) {
-    *invalid_rseq_cs = true;
-    return false;
-  }
-  if (ip().register_value() - rseq_cs.start_ip < rseq_cs.post_commit_offset) {
-    *new_ip = remote_code_ptr(rseq_cs.abort_ip);
-  }
+  *new_ip = remote_code_ptr(rseq_cs.abort_ip);
   return true;
 }
 

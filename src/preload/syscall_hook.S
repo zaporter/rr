@@ -1,4 +1,8 @@
+#if defined(__aarch64__)
+        .set preload_thread_locals,0x70010000
+#else
         .set preload_thread_locals,0x70001000
+#endif
 
         .global _syscallbuf_code_start
         .hidden _syscallbuf_code_start
@@ -204,7 +208,7 @@ name:                           \
         .cfi_escape 0x10, /* DW_CFA_expression */               \
                     0x08, /* %eip */                            \
                     0x05, /* 5 byte expression follows */       \
-                    0x03, /* DW_OP_addr */                      \
+                    0x0c, /* DW_OP_const4u */                   \
                     /* Individually place bytes */              \
                     stub_scratch_1 & 0xFF,                      \
                     (stub_scratch_1 & (0xFF <<  0x8)) >>  0x8,  \
@@ -430,7 +434,7 @@ name:                              \
         .cfi_escape 0x10, /* DW_CFA_expression */               \
                     0x10, /* %rip */                            \
                     0x09, /* 9 byte expression follows */       \
-                    0x03, /* DW_OP_addr */                      \
+                    0x0e, /* DW_OP_const8u */                   \
                     /* Individually place bytes */              \
                     stub_scratch_1 & 0xFF,                      \
                     (stub_scratch_1 & (0xFF <<  0x8)) >>  0x8,  \
@@ -477,6 +481,16 @@ SYSCALLHOOK_START(_syscall_hook_trampoline_48_3d_00_f0_ff_ff)
         callq __morestack
         cmpq $0xfffffffffffff000,%rax
 SYSCALLHOOK_END(_syscall_hook_trampoline_48_3d_00_f0_ff_ff)
+
+SYSCALLHOOK_START(_syscall_hook_trampoline_48_89_45_f8)
+        callq __morestack
+        mov %rax,-8(%rbp)
+SYSCALLHOOK_END(_syscall_hook_trampoline_48_89_45_f8)
+
+SYSCALLHOOK_START(_syscall_hook_trampoline_48_89_c3)
+        callq __morestack
+        mov %rax,%rbx
+SYSCALLHOOK_END(_syscall_hook_trampoline_48_89_c3)
 
 SYSCALLHOOK_START(_syscall_hook_trampoline_48_8b_3c_24)
          callq __morestack

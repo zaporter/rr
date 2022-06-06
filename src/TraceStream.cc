@@ -1432,9 +1432,11 @@ void TraceWriter::close(CloseStatus status, const TraceUuid* uuid) {
   }
   header.setOk(status == CLOSE_OK);
   header.setChaosMode(chaos_mode ? trace::ChaosMode::KNOWN_TRUE : trace::ChaosMode::KNOWN_FALSE);
-  MemoryRange exclusion_range = AddressSpace::get_global_exclusion_range();
+  MemoryRange exclusion_range = AddressSpace::get_global_exclusion_range(nullptr);
   header.setExclusionRangeStart(exclusion_range.start().as_int());
   header.setExclusionRangeEnd(exclusion_range.end().as_int());
+  header.setRuntimePageSize(page_size());
+  header.setPreloadLibraryPageSize(PRELOAD_LIBRARY_PAGE_SIZE);
 
   try {
     writePackedMessageToFd(version_fd, header_msg);

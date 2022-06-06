@@ -73,6 +73,7 @@
 #include "BpfMapMonitor.h"
 #include "DiversionSession.h"
 #include "ElfReader.h"
+#include "FileMonitor.h"
 #include "Flags.h"
 #include "MmappedFileMonitor.h"
 #include "NonvirtualPerfCounterMonitor.h"
@@ -2202,7 +2203,8 @@ static bool maybe_pause_instead_of_waiting(RecordTask* t, int options) {
 
 static RecordTask* verify_ptrace_target(RecordTask* tracer,
                                         TaskSyscallState& syscall_state,
-                                        pid_t pid) {
+                                        pid_t pid,
+                                        bool require_stopped = true) {
   RecordTask* tracee = tracer->session().find_task(pid);
   if (!tracee) {
     LOG(debug) << "tracee pid " << pid << " is unknown to rr";
@@ -2214,7 +2216,7 @@ static RecordTask* verify_ptrace_target(RecordTask* tracer,
     syscall_state.emulate_result(-ESRCH);
     return nullptr;
   }
-  if (tracee->emulated_stop_type == NOT_STOPPED) {
+  if (require_stopped && tracee->emulated_stop_type == NOT_STOPPED) {
     LOG(debug) << pid << " is not in a ptrace stop";
     syscall_state.emulate_result(-ESRCH);
     return nullptr;
@@ -2394,7 +2396,7 @@ static void ptrace_attach_to_already_stopped_task(RecordTask* t) {
   ASSERT(t, t->emulated_stop_type == GROUP_STOP);
   // tracee is already stopped because of a group-stop signal.
   // Sending a SIGSTOP won't work, but we don't need to.
-  t->force_emulate_ptrace_stop(WaitStatus::for_stop_sig(SIGSTOP));
+  t->force_emulate_ptrace_stop(WaitStatus::for_stop_sig(SIGSTOP), t->emulated_stop_type);
   siginfo_t si;
   memset(&si, 0, sizeof(si));
   si.si_signo = SIGSTOP;
@@ -2415,46 +2417,6 @@ static void prepare_ptrace_legacy(RecordTask* t,
   pid_t pid = (pid_t)t->regs().arg2_signed();
   int command = (int)t->regs().arg1_signed();
   switch (command) {
-    case PTRACE_PEEKTEXT:
-    case PTRACE_PEEKDATA: {
-      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
-      if (tracee) {
-        // The actual syscall returns the data via the 'data' out-parameter.
-        // The behavior of returning the data as the system call result is
-        // provided by the glibc wrapper.
-        auto datap =
-            syscall_state.reg_parameter<typename Arch::unsigned_word>(4);
-        remote_ptr<typename Arch::unsigned_word> addr = t->regs().arg3();
-        bool ok = true;
-        auto v = tracee->read_mem(addr, &ok);
-        if (ok) {
-          t->write_mem(datap, v);
-          syscall_state.emulate_result(0);
-        } else {
-          syscall_state.emulate_result(-EIO);
-        }
-      }
-      break;
-    }
-    case PTRACE_POKETEXT:
-    case PTRACE_POKEDATA: {
-      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
-      if (tracee) {
-        remote_ptr<typename Arch::unsigned_word> addr = t->regs().arg3();
-        typename Arch::unsigned_word data = t->regs().arg4();
-        bool ok = true;
-        tracee->write_mem(addr, data, &ok);
-        if (ok) {
-          // Since we're recording data that might not be for |t|, we have to
-          // handle this specially during replay.
-          tracee->record_local(addr, &data);
-          syscall_state.emulate_result(0);
-        } else {
-          syscall_state.emulate_result(-EIO);
-        }
-      }
-      break;
-    }
     case Arch::PTRACE_PEEKUSR: {
       RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
       if (tracee) {
@@ -2899,6 +2861,67 @@ static Switchable prepare_ptrace(RecordTask* t,
       }
       break;
     }
+    case PTRACE_INTERRUPT: {
+      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid, false);
+      if (tracee) {
+        if (tracee->is_running()) {
+          // Running in a blocked syscall. Forward the PTRACE_INTERRUPT.
+          // Regular syscall exit handling will take over from here.
+          bool alive = tracee->ptrace_if_alive(PTRACE_INTERRUPT, nullptr, nullptr);
+          syscall_state.emulate_result(alive ? 0 : -ESRCH);
+        } else if (tracee->status().is_syscall()) {
+          tracee->emulate_ptrace_stop(tracee->status(), SYSCALL_EXIT_STOP);
+        } else if (tracee->emulated_stop_pending == NOT_STOPPED) {
+          // The tracee is stopped from our perspective, but not stopped from
+          // the perspective of the ptracer. Emulate a stop now.
+          tracee->apply_group_stop(SIGSTOP);
+        }
+        // Otherwise, there's nothing to do.
+        syscall_state.emulate_result(0);
+      }
+      break;
+    }
+    case PTRACE_GET_SYSCALL_INFO: {
+      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
+      if (tracee) {
+        remote_ptr<uint8_t> remote_addr(t->regs().arg4());
+        bool ok = true;
+        typename Arch::ptrace_syscall_info info;
+        memset(&info, 0, sizeof(info));
+        info.op =
+          tracee->emulated_stop_type == SYSCALL_ENTRY_STOP ? PTRACE_SYSCALL_INFO_ENTRY :
+          tracee->emulated_stop_type == SYSCALL_EXIT_STOP  ? PTRACE_SYSCALL_INFO_EXIT :
+          tracee->emulated_stop_type == SECCOMP_STOP       ? PTRACE_SYSCALL_INFO_SECCOMP :
+                                                             PTRACE_SYSCALL_INFO_NONE;
+        info.arch = to_audit_arch(tracee->arch());
+        info.instruction_pointer = tracee->ip().register_value();
+        info.stack_pointer = tracee->regs().sp().as_int();
+        size_t max_size = 0;
+        if (info.op == PTRACE_SYSCALL_INFO_ENTRY) {
+          info.entry.nr = tracee->regs().original_syscallno();
+          for (int i = 0; i < 6; ++i) {
+            info.entry.args[i] = tracee->regs().arg(i+1);
+          }
+          max_size = ((char*)&info.entry.args[6] - (char*)&info);
+        } else if (info.op == PTRACE_SYSCALL_INFO_EXIT) {
+          info.exit.rval = tracee->regs().syscall_result_signed();
+          info.exit.is_error = tracee->regs().syscall_result_signed() < 0;
+          max_size = ((char*)&info.exit.is_error - (char*)&info) + 1;
+        } else if (info.op == PTRACE_SYSCALL_INFO_SECCOMP) {
+          ASSERT(tracee, false) << "Unimplemented: PTRACE_SYSCALL_INFO_SECCOMP";
+        }
+        size_t user_size = t->regs().arg3();
+        size_t to_write = min(user_size, max_size);
+        t->write_mem(remote_addr, (uint8_t*)&info, to_write, &ok);
+        if (!ok) {
+          syscall_state.emulate_result(-EFAULT);
+          break;
+        }
+        t->record_local(remote_addr, (uint8_t*)&info, to_write);
+        syscall_state.emulate_result(max_size);
+      }
+      break;
+    }
     case Arch::PTRACE_GET_THREAD_AREA:
     case Arch::PTRACE_SET_THREAD_AREA: {
       RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
@@ -2975,10 +2998,46 @@ static Switchable prepare_ptrace(RecordTask* t,
       }
       break;
     }
-    case Arch::PTRACE_PEEKTEXT:
-    case Arch::PTRACE_PEEKDATA:
-    case Arch::PTRACE_POKETEXT:
-    case Arch::PTRACE_POKEDATA:
+    case PTRACE_PEEKTEXT:
+    case PTRACE_PEEKDATA: {
+      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
+      if (tracee) {
+        // The actual syscall returns the data via the 'data' out-parameter.
+        // The behavior of returning the data as the system call result is
+        // provided by the glibc wrapper.
+        auto datap =
+            syscall_state.reg_parameter<typename Arch::unsigned_word>(4);
+        remote_ptr<typename Arch::unsigned_word> addr = t->regs().arg3();
+        bool ok = true;
+        auto v = tracee->read_mem(addr, &ok);
+        if (ok) {
+          t->write_mem(datap, v);
+          syscall_state.emulate_result(0);
+        } else {
+          syscall_state.emulate_result(-EIO);
+        }
+      }
+      break;
+    }
+    case PTRACE_POKETEXT:
+    case PTRACE_POKEDATA: {
+      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
+      if (tracee) {
+        remote_ptr<typename Arch::unsigned_word> addr = t->regs().arg3();
+        typename Arch::unsigned_word data = t->regs().arg4();
+        bool ok = true;
+        tracee->write_mem(addr, data, &ok);
+        if (ok) {
+          // Since we're recording data that might not be for |t|, we have to
+          // handle this specially during replay.
+          tracee->record_local(addr, &data);
+          syscall_state.emulate_result(0);
+        } else {
+          syscall_state.emulate_result(-EIO);
+        }
+      }
+      break;
+    }
     case Arch::PTRACE_PEEKUSR:
     case Arch::PTRACE_POKEUSR:
     case Arch::PTRACE_GETREGS:
@@ -3093,6 +3152,22 @@ static void prepare_exit(RecordTask* t) {
 
 static void prepare_mmap_register_params(RecordTask* t) {
   Registers r = t->regs();
+
+  FileMonitor* monitor = t->fd_table()->get_monitor(r.arg5_signed());
+  if (monitor) {
+    switch (monitor->type()) {
+      case FileMonitor::VirtualPerfCounter:
+      case FileMonitor::NonvirtualPerfCounter:
+        LOG(info) << "Faking failure of mmap for perf event counter";
+        // Force mmap to fail by setting fd to our tracee socket
+        r.set_arg5(t->session().tracee_fd_number());
+        t->set_regs(r);
+        return;
+      default:
+        break;
+    }
+  }
+
   intptr_t mask_flag = MAP_FIXED;
 #ifdef MAP_32BIT
   mask_flag |= MAP_32BIT;
@@ -3137,12 +3212,12 @@ static void init_scratch_memory(RecordTask* t,
     AutoRemoteSyscalls remote(t);
 
     if (addr_type == DYNAMIC_ADDRESS) {
-      t->scratch_ptr = remote.infallible_mmap_syscall(remote_ptr<void>(), sz,
-                                                      prot, flags, -1, 0);
+      t->scratch_ptr = remote.infallible_mmap_syscall_if_alive(remote_ptr<void>(), sz,
+                                                               prot, flags, -1, 0);
     } else {
       t->scratch_ptr =
-          remote.infallible_mmap_syscall(remote_ptr<void>(FIXED_SCRATCH_PTR),
-                                         sz, prot, flags | MAP_FIXED, -1, 0);
+          remote.infallible_mmap_syscall_if_alive(remote_ptr<void>(FIXED_SCRATCH_PTR),
+                                                  sz, prot, flags | MAP_FIXED, -1, 0);
     }
     t->scratch_size = scratch_size;
   }
@@ -3274,6 +3349,14 @@ static void prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) {
   new_task->set_regs(new_r);
   new_task->canonicalize_regs(new_task->arch());
   new_task->set_termination_signal(termination_signal);
+  // If the task got killed right away, we need to treat this
+  // as if we are just finished a syscall
+  // so as not to trigger the logic in handle_ptrace_exit_event().
+  // Otherwise, we'll capture the current registers as if it's a syscall entry
+  // which would look like a clone/fork/vfork syscall on the dead thread.
+  // During replay, we'll see this ghost clone and would fail to find
+  // the resulting thread from the clone and crash.
+  new_task->ip_at_last_recorded_syscall_exit = new_r.ip();
 
   /* record child id here */
   if (is_clone_syscall(original_syscall, r.arch())) {
@@ -3391,7 +3474,7 @@ static void record_ranges(RecordTask* t,
 
 static pid_t do_detach_teleport(RecordTask *t)
 {
-  DiversionSession session;
+  DiversionSession session(t->session().cpu_binding());
   // Use the old task's exe path to make sure that /proc/<pid>/exe looks right
   // for the teleported task.
   std::string exe_path(t->proc_exe_path());
@@ -3423,7 +3506,7 @@ static pid_t do_detach_teleport(RecordTask *t)
   new_t->reenable_cpuid_tsc();
   {
     AutoRemoteSyscalls remote(new_t, AutoRemoteSyscalls::DISABLE_MEMORY_PARAMS);
-    remote.syscall(syscall_number_for_close(new_t->arch()), tracee_fd_number);
+    remote.infallible_close_syscall_if_alive(tracee_fd_number);
   }
   t->vm()->monkeypatcher().unpatch_syscalls_in(new_t);
   // Try to reset the scheduler affinity that we enforced upon the task.
@@ -3740,7 +3823,7 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
         }
 
         default:
-          syscall_state.expect_errno = EINVAL;
+          syscall_state.expect_errno = ENOSYS;
           break;
       }
       return PREVENT_SWITCH;
@@ -4036,11 +4119,12 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
                  (size_t)regs.arg4()));
       return PREVENT_SWITCH;
 
+    case Arch::close_range:
     case Arch::clone3:
     case Arch::io_uring_setup:
     case Arch::io_setup: {
-      // Prevent the io_setup/io_uring_setup/clone3 from running and fake an ENOSYS return. We want
-      // to stop applications from using these APIs because we don't support them currently.
+      // Prevent the various syscalls that we don't support from being used by
+      // applications and fake an ENOSYS return.
       Registers r = regs;
       r.set_arg2(0);
       t->set_regs(r);
@@ -4504,7 +4588,7 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
           break;
         }
 
-        case PR_SET_MM:{
+        case PR_SET_MM: {
           switch ((unsigned long)regs.arg2()) {
             case PR_SET_MM_MAP_SIZE:
               syscall_state.reg_parameter(3, sizeof(unsigned int));
@@ -4514,8 +4598,23 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
               syscall_state.expect_errno = EINVAL;
               break;
           }
+          break;
         }
-        break;
+
+        case PR_SET_VMA: {
+          switch (regs.arg2()) {
+            case PR_SET_VMA_ANON_NAME:
+              // PR_SET_VMA_ANON_NAME is used to communicate additional details
+              // about the VMA to the kernel. VMAs with different anonymous
+              // names are not merged by the kernel. None of this affects rr,
+              // and this prctl has no outparams.
+              break;
+            default:
+              syscall_state.expect_errno = EINVAL;
+              break;
+          }
+          break;
+        }
 
         default:
           syscall_state.expect_errno = EINVAL;
@@ -4870,7 +4969,15 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
         case Arch::StructArguments: {
           auto args =
               t->read_mem(remote_ptr<typename Arch::mmap_args>(regs.arg1()));
-          // XXX fix this
+          // XXX fix these unsupported features?
+          // only the most ancient code should be using old-style mmap on 32bit,
+          // modern glibc uses mmap2.
+          FileMonitor* monitor = t->fd_table()->get_monitor(args.fd);
+          if (monitor) {
+            FileMonitor::Type monitor_type = monitor->type();
+            ASSERT(t, monitor_type != FileMonitor::VirtualPerfCounter &&
+              monitor_type != FileMonitor::NonvirtualPerfCounter);
+          }
           ASSERT(t, !(args.flags & MAP_GROWSDOWN));
           break;
         }
@@ -4978,6 +5085,31 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
         return PREVENT_SWITCH;
       }
       t->tick_request_override = (TicksRequest)r.arg(1);
+      syscall_state.emulate_result(0);
+      syscall_state.expect_errno = ENOSYS;
+      return PREVENT_SWITCH;
+    }
+
+    case SYS_rrcall_freeze_tid: {
+      Registers r = t->regs();
+      bool arguments_are_zero = true;
+      for (int i = 3; i <= 6; ++i) {
+        arguments_are_zero &= r.arg(i) == 0;
+      }
+      pid_t tid = r.arg(1);
+      int enable = r.arg(2);
+      if (!arguments_are_zero || (enable != 0 && enable != 1)) {
+        syscall_state.emulate_result((uintptr_t)-EINVAL);
+        syscall_state.expect_errno = ENOSYS;
+        return PREVENT_SWITCH;
+      }
+      RecordTask *requested_task = t->session().find_task(tid);
+      if (!requested_task) {
+        syscall_state.emulate_result((uintptr_t)-ESRCH);
+        syscall_state.expect_errno = ENOSYS;
+        return PREVENT_SWITCH;
+      }
+      requested_task->schedule_frozen = enable;
       syscall_state.emulate_result(0);
       syscall_state.expect_errno = ENOSYS;
       return PREVENT_SWITCH;
@@ -5291,6 +5423,8 @@ static string try_make_process_file_name(RecordTask* t,
 static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
   Registers r = t->regs();
   if (r.syscall_failed()) {
+    // Otherwise we would have done this during PTRACE_EVENT_EXEC
+    t->session().scheduler().did_exit_execve(t);
     return;
   }
 
@@ -5406,8 +5540,8 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
         remote.infallible_syscall(syscall_number_for_munmap(remote.arch()),
                                   km.start() - page_size(), page_size());
       }
-      remote.infallible_mmap_syscall(km.start(), km.size(), km.prot(), flags,
-                                     -1, 0);
+      remote.infallible_mmap_syscall_if_alive(km.start(), km.size(), km.prot(), flags,
+                                              -1, 0);
       t->write_mem(km.start().cast<uint8_t>(), buf.data(), buf.size());
     }
   }
@@ -5577,14 +5711,13 @@ static vector<WriteHole> find_holes(RecordTask* t, int desc, uint64_t offset, ui
 }
 
 static void process_mmap(RecordTask* t, size_t length, int prot, int flags,
-                         int fd, off_t offset_pages) {
+                         int fd, off64_t offset) {
   if (t->regs().syscall_failed()) {
     // We purely emulate failed mmaps.
     return;
   }
 
   size_t size = ceil_page_size(length);
-  off64_t offset = offset_pages * 4096;
   remote_ptr<void> addr = t->regs().syscall_result();
   if (flags & MAP_ANONYMOUS) {
     KernelMapping km;
@@ -5683,7 +5816,7 @@ static void process_mmap(RecordTask* t, size_t length, int prot, int flags,
         } else {
           ASSERT(rt, false)
               << "Expected monitor type Mmapped | ODirect for fd " << f.fd << ", got monitor type "
-              << type;
+              << file_monitor_type_name(type);
         }
       } else {
         rt->fd_table()->add_monitor(rt, f.fd, new MmappedFileMonitor(rt, f.fd));
@@ -5703,7 +5836,7 @@ static void process_mmap(RecordTask* t, size_t length, int prot, int flags,
   // at an assertion, in the worst case, we'd end up modifying the underlying
   // file.
   if (!(flags & MAP_SHARED)) {
-    t->vm()->monkeypatcher().patch_after_mmap(t, addr, size, offset_pages, fd,
+    t->vm()->monkeypatcher().patch_after_mmap(t, addr, size, offset, fd,
                                               Monkeypatcher::MMAP_SYSCALL);
   }
 
@@ -6078,10 +6211,14 @@ static void fake_gcrypt_file(RecordTask* t, Registers* r) {
   {
     AutoRemoteSyscalls remote(t);
     lseek(fd, 0, SEEK_SET);
-    child_fd = remote.send_fd(fd);
+    child_fd = remote.infallible_send_fd_if_alive(fd);
+    if (child_fd < 0) {
+      // Tracee died.
+      return;
+    }
   }
 
-  // And hand out our fake file.
+  // And hand out our fake file
   r->set_syscall_result(child_fd);
 }
 
@@ -6147,17 +6284,7 @@ static void rec_process_syscall_arch(RecordTask* t,
 
     case Arch::execve:
     case Arch::execveat:
-      t->session().scheduler().did_exit_execve(t);
       process_execve(t, syscall_state);
-      if (t->emulated_ptracer) {
-        if (t->emulated_ptrace_options & PTRACE_O_TRACEEXEC) {
-          t->emulate_ptrace_stop(
-              WaitStatus::for_ptrace_event(PTRACE_EVENT_EXEC));
-        } else if (!t->emulated_ptrace_seized) {
-          // Inject legacy SIGTRAP-after-exec
-          t->tgkill(SIGTRAP);
-        }
-      }
       break;
 
     case Arch::brk: {
@@ -6189,7 +6316,7 @@ static void rec_process_syscall_arch(RecordTask* t,
           auto args = t->read_mem(
               remote_ptr<typename Arch::mmap_args>(t->regs().orig_arg1()));
           process_mmap(t, args.len, args.prot, args.flags, args.fd,
-                       args.offset / 4096);
+                       args.offset);
           break;
         }
         case Arch::RegisterArguments: {
@@ -6198,9 +6325,10 @@ static void rec_process_syscall_arch(RecordTask* t,
           r.set_arg4(syscall_state.syscall_entry_registers.arg4_signed());
           process_mmap(t, (size_t)r.arg2(), (int)r.arg3_signed(),
                        (int)r.arg4_signed(), (int)r.arg5_signed(),
-                       ((off_t)r.arg6_signed()) / 4096);
+                       ((off_t)r.arg6_signed()));
           r.set_arg2(syscall_state.syscall_entry_registers.arg2_signed());
           r.set_arg3(syscall_state.syscall_entry_registers.arg3_signed());
+          r.set_arg5(syscall_state.syscall_entry_registers.arg5_signed());
           t->set_regs(r);
           break;
         }
@@ -6213,9 +6341,10 @@ static void rec_process_syscall_arch(RecordTask* t,
       r.set_arg4(syscall_state.syscall_entry_registers.arg4_signed());
       process_mmap(t, (size_t)r.arg2(), (int)r.arg3_signed(),
                    (int)r.arg4_signed(), (int)r.arg5_signed(),
-                   (off_t)r.arg6_signed());
+                   (off_t)r.arg6_signed() * 4096);
       r.set_arg2(syscall_state.syscall_entry_registers.arg2_signed());
       r.set_arg3(syscall_state.syscall_entry_registers.arg3_signed());
+      r.set_arg5(syscall_state.syscall_entry_registers.arg5_signed());
       t->set_regs(r);
       break;
     }
@@ -6245,7 +6374,7 @@ static void rec_process_syscall_arch(RecordTask* t,
 
     case Arch::bpf:
       if (!t->regs().syscall_failed()) {
-        switch ((int)t->regs().arg1()) {
+        switch ((int)t->regs().orig_arg1()) {
           case BPF_MAP_CREATE: {
             int fd = t->regs().syscall_result_signed();
             auto attr = t->read_mem(remote_ptr<typename Arch::bpf_attr>(t->regs().arg2()));
@@ -6300,7 +6429,7 @@ static void rec_process_syscall_arch(RecordTask* t,
         r.set_syscall_result(-EACCES);
         t->set_regs(r);
       }
-      maybe_process_new_socket(t, r.arg1());
+      maybe_process_new_socket(t, r.orig_arg1());
       break;
     }
 
@@ -6329,7 +6458,7 @@ static void rec_process_syscall_arch(RecordTask* t,
         if (gcrypt || is_blacklisted_filename(pathname.c_str())) {
           {
             AutoRemoteSyscalls remote(t);
-            remote.infallible_syscall(syscall_number_for_close(remote.arch()), fd);
+            remote.infallible_close_syscall_if_alive(fd);
           }
           if (gcrypt) {
             fake_gcrypt_file(t, &r);
@@ -6461,7 +6590,7 @@ static void rec_process_syscall_arch(RecordTask* t,
       t->set_regs(r);
 
       if (!r.syscall_failed() && r.arg3() == O_DIRECT) {
-        int fd = r.arg1();
+        int fd = r.orig_arg1();
         // O_DIRECT can impose unknown alignment requirements, in which case
         // syscallbuf records will not be properly aligned and will cause I/O
         // to fail. Disable syscall buffering for O_DIRECT files.
@@ -6478,6 +6607,7 @@ static void rec_process_syscall_arch(RecordTask* t,
     }
 
     case Arch::clone3:
+    case Arch::close_range:
     case Arch::close:
     case Arch::dup2:
     case Arch::dup3:
@@ -6612,7 +6742,7 @@ static void rec_process_syscall_arch(RecordTask* t,
           ASSERT(t,
                  ret == -ENOENT || ret == -ENODEV || ret == -ENOTBLK ||
                      ret == -EINVAL)
-              << " unknown quotactl(" << HEX(t->regs().arg1() >> SUBCMDSHIFT)
+              << " unknown quotactl(" << HEX(t->regs().orig_arg1() >> SUBCMDSHIFT)
               << ")";
           break;
         }

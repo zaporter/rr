@@ -55,10 +55,21 @@ set(supports32bit true)
 set(x86ish false)
 if (${CMAKE_SYSTEM_PROCESSOR} STREQUAL "aarch64")
   set(supports32bit false)
-  set(FLAGS_COMMON "${FLAGS_COMMON} -march=armv8.3-a -Wl,-dynamic-linker=/lib/aarch64-linux-gnu/atomics/ld-linux-aarch64.so.1")
+  set(FLAGS_COMMON "${FLAGS_COMMON} -march=armv8.3-a -moutline-atomics")
+  set(PRELOAD_LIBRARY_PAGE_SIZE 65536)
+  set(VDSO_NAME "LINUX_2.6.39")
 else()
   set(x86ish true)
   set(FLAGS_COMMON "${FLAGS_COMMON} -msse2 -D__MMX__ -D__SSE__ -D__SSE2__")
+  set(PRELOAD_LIBRARY_PAGE_SIZE 4096)
+  set(VDSO_NAME "LINUX_2.6")
+endif()
+configure_file(src/preload/rr_page.ld.in src/preload/rr_page.ld @ONLY)
+
+include(CheckCCompilerFlag)
+CHECK_C_COMPILER_FLAG("-fmacro-prefix-map=foo=bar" SUPPORTS_MACRO_PREFIX_MAP)
+if (SUPPORTS_MACRO_PREFIX_MAP)
+  set(FLAGS_COMMON "${FLAGS_COMMON} -fmacro-prefix-map=${CMAKE_SOURCE_DIR}/=")
 endif()
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${FLAGS_COMMON} -Wstrict-prototypes -std=gnu11")
@@ -161,25 +172,29 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${rr_MBITNESS_OPTION}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${rr_MBITNESS_OPTION}")
 set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} ${rr_MBITNESS_OPTION}")
 
-find_package(PkgConfig REQUIRED)
+# If SKIP_PKGCONFIG is set then ${PKG}_CFLAGS and ${PKG}_LDFLAGS must be
+# provided as well.
+if(NOT SKIP_PKGCONFIG)
+  find_package(PkgConfig REQUIRED)
 
-# If we're cross-compiling a 32-bit rr build on a 64-bit host we need
-# to ensure we're looking for the right libraries.
-# This has been tested on Ubuntu and Fedora.
-if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64" AND NOT rr_64BIT)
-  set(LIBDIR32_CANDIDATES
-    /usr/lib/i386-linux-gnu/pkgconfig/
-    /usr/lib/pkgconfig/
-  )
-  foreach(libdir ${LIBDIR32_CANDIDATES})
-    if(IS_DIRECTORY ${libdir})
-      set(ENV{PKG_CONFIG_LIBDIR} ${libdir})
-      break()
-     endif()
-   endforeach(libdir)
-   if(NOT DEFINED ENV{PKG_CONFIG_LIBDIR})
-     message(FATAL_ERROR "Couldn't find a suitable 32-bit pkgconfig lib dir. You probably need to install a 32-bit pkgconfig package (pkgconfig.i686 for Fedora or pkg-config:i386 for Ubuntu")
-   endif()
+  # If we're cross-compiling a 32-bit rr build on a 64-bit host we need
+  # to ensure we're looking for the right libraries.
+  # This has been tested on Ubuntu and Fedora.
+  if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64" AND NOT rr_64BIT)
+    set(LIBDIR32_CANDIDATES
+      /usr/lib/i386-linux-gnu/pkgconfig/
+      /usr/lib/pkgconfig/
+    )
+    foreach(libdir ${LIBDIR32_CANDIDATES})
+      if(IS_DIRECTORY ${libdir})
+        set(ENV{PKG_CONFIG_LIBDIR} ${libdir})
+        break()
+      endif()
+    endforeach(libdir)
+    if(NOT DEFINED ENV{PKG_CONFIG_LIBDIR})
+      message(FATAL_ERROR "Couldn't find a suitable 32-bit pkgconfig lib dir. You probably need to install a 32-bit pkgconfig package (pkgconfig.i686 for Fedora or pkg-config:i386 for Ubuntu")
+    endif()
+  endif()
 endif()
 
 find_program(CAPNP capnp)
@@ -189,11 +204,15 @@ endif()
 
 set(REQUIRED_LIBS
   capnp
+# zlib is required to handle ELF compression
+  zlib
 )
 
 foreach(required_lib ${REQUIRED_LIBS})
   string(TOUPPER ${required_lib} PKG)
-  pkg_check_modules(${PKG} REQUIRED ${required_lib})
+  if(NOT SKIP_PKGCONFIG)
+    pkg_check_modules(${PKG} REQUIRED ${required_lib})
+  endif()
   if(staticlibs)
     string(REPLACE ";" " " ${PKG}_STATIC_CFLAGS "${${PKG}_STATIC_CFLAGS}")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${${PKG}_STATIC_CFLAGS}")
@@ -277,10 +296,34 @@ set_source_files_properties(${BROTLI_FILES}
                             PROPERTIES COMPILE_FLAGS ${BROTLI_COMPILE_FLAGS})
 # ==== brotli ====
 
+find_library(LIBRT rt)
+
 find_path(SECCOMP NAMES "linux/seccomp.h")
 if(NOT SECCOMP)
   message(FATAL_ERROR "Couldn't find linux/seccomp.h. You may need to upgrade your kernel.")
 endif()
+
+find_path(EXECINFO_H NAMES "execinfo.h")
+if(EXECINFO_H)
+  add_definitions(-DEXECINFO_H=1)
+else()
+  message(AUTHOR_WARNING "execinfo.h not present. Automatic backtraces for failures in rr are disabled.")
+endif()
+
+find_path(PROC_SERVICE_H NAMES "proc_service.h")
+if(PROC_SERVICE_H)
+  add_definitions(-DPROC_SERVICE_H=1)
+else()
+  message(AUTHOR_WARNING "proc_service.h not present. Support for libthread_db.so is disabled.")
+endif()
+
+include(CheckSymbolExists)
+list(APPEND CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+check_symbol_exists(LAV_CURRENT "link.h" RTLD_AUDIT)
+if(NOT RTLD_AUDIT)
+  message(AUTHOR_WARNING "Couldn't find rtld-audit support. librraudit skipped.")
+endif()
+list(REMOVE_ITEM CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
 
 set(Python_ADDITIONAL_VERSIONS 3 3.8 3.7 3.6 3.5 3.4 3.3 3.2 3.1 3.0)
 find_package(PythonInterp 3 REQUIRED)
@@ -334,7 +377,6 @@ set(RR_PAGE_SOURCE_FILES
   ${RR_PAGE_FILES}
   rr_page_instructions.S
   rr_vdso.S
-  rr_page.ld
 )
 add_library(rrpage)
 foreach(file ${RR_PAGE_FILES})
@@ -347,29 +389,34 @@ endforeach(file)
 # we want it to have the same SONAME as the real vDSO to trick things
 # like AddressSanitizer into recognising it as the vDSO.
 set_target_properties(rrpage PROPERTIES NO_SONAME ON)
-set_target_properties(rrpage PROPERTIES LINK_FLAGS "-Wl,-T -Wl,${CMAKE_SOURCE_DIR}/src/preload/rr_page.ld -Wl,--hash-style=both -nostartfiles -nostdlib -Wl,-z,max-page-size=0x1000 -Wl,-soname,linux-vdso.so.1 ${LINKER_FLAGS}")
-set_target_properties(rrpage PROPERTIES LINK_DEPENDS ${CMAKE_SOURCE_DIR}/src/preload/rr_page.ld)
+set_target_properties(rrpage PROPERTIES LINK_FLAGS "-Wl,-T -Wl,${CMAKE_BINARY_DIR}/src/preload/rr_page.ld -Wl,--hash-style=both -nostartfiles -nostdlib -Wl,-z,max-page-size=${PRELOAD_LIBRARY_PAGE_SIZE} -Wl,-soname,linux-vdso.so.1 ${LINKER_FLAGS}")
+set_target_properties(rrpage PROPERTIES LINK_DEPENDS ${CMAKE_BINARY_DIR}/src/preload/rr_page.ld)
 # CMake seems to have trouble generating the link line without this
 set_target_properties(rrpage PROPERTIES LINKER_LANGUAGE C)
 
 add_custom_command(TARGET rrpage POST_BUILD
-                   COMMAND ${CMAKE_SOURCE_DIR}/src/preload/tweak_librrpage.py $<TARGET_FILE:rrpage>)
+                   COMMAND ${CMAKE_SOURCE_DIR}/src/preload/tweak_librrpage.py $<TARGET_FILE:rrpage> ${PRELOAD_LIBRARY_PAGE_SIZE})
 
 # Order matters here! syscall_hook.S must be immediately before syscallbuf.c,
 # raw_syscall.S must be before overrides.c, which must be last.
-set(PRELOAD_FILES
-  syscall_hook.S
-  syscallbuf.c
-  raw_syscall.S
-  overrides.c
-)
+if(x86ish)
+  set(PRELOAD_FILES
+    syscall_hook.S
+    syscallbuf.c
+    raw_syscall.S
+    overrides.c
+    )
+else()
+  set(PRELOAD_FILES
+    overrides.c
+    )
+endif()
 set(PRELOAD_SOURCE_FILES
   ${PRELOAD_FILES}
   preload_interface.h
   rrcalls.h
   syscallbuf.h
 )
-if (x86ish)
 add_library(rrpreload)
 foreach(file ${PRELOAD_FILES})
   target_sources(rrpreload PUBLIC "${CMAKE_SOURCE_DIR}/src/preload/${file}")
@@ -378,27 +425,28 @@ foreach(file ${PRELOAD_FILES})
 endforeach(file)
 set_target_properties(rrpreload PROPERTIES LINK_FLAGS "-nostartfiles ${LINKER_FLAGS}")
 set_target_properties(rrpreload PROPERTIES INSTALL_RPATH "\$ORIGIN")
-endif()
 
-set(AUDIT_FILES
-  rtld-audit.c
-  stap-note-iter.c
-  ../preload/raw_syscall.S
-)
-set(AUDIT_SOURCE_FILES
-  ${AUDIT_FILES}
-  rtld-audit.h
-  stap-note-iter.h
-  ../preload/preload_interface.h
-  ../preload/rrcalls.h
-)
-add_library(rraudit)
-foreach(file ${AUDIT_FILES})
-  target_sources(rraudit PUBLIC "${CMAKE_SOURCE_DIR}/src/audit/${file}")
-  set_source_files_properties("${CMAKE_SOURCE_DIR}/src/audit/${file}"
-                              PROPERTIES COMPILE_FLAGS ${PRELOAD_COMPILE_FLAGS})
-endforeach(file)
-set_target_properties(rraudit PROPERTIES LINK_FLAGS "-nostartfiles -ldl ${LINKER_FLAGS}")
+if(RTLD_AUDIT)
+  set(AUDIT_FILES
+    rtld-audit.c
+    stap-note-iter.c
+    ../preload/raw_syscall.S
+  )
+  set(AUDIT_SOURCE_FILES
+    ${AUDIT_FILES}
+    rtld-audit.h
+    stap-note-iter.h
+    ../preload/preload_interface.h
+    ../preload/rrcalls.h
+  )
+  add_library(rraudit)
+  foreach(file ${AUDIT_FILES})
+    target_sources(rraudit PUBLIC "${CMAKE_SOURCE_DIR}/src/audit/${file}")
+    set_source_files_properties("${CMAKE_SOURCE_DIR}/src/audit/${file}"
+                                PROPERTIES COMPILE_FLAGS ${PRELOAD_COMPILE_FLAGS})
+  endforeach(file)
+  set_target_properties(rraudit PROPERTIES LINK_FLAGS "-nostartfiles -ldl ${LINKER_FLAGS}")
+endif()
 
 # Ensure that CMake knows about our generated files.
 #
@@ -515,7 +563,6 @@ set(RR_SOURCES
   src/SysCpuMonitor.cc
   src/Task.cc
   src/ThreadGroup.cc
-  src/ThreadDb.cc
   src/TraceFrame.cc
   src/TraceInfoCommand.cc
   src/TraceStream.cc
@@ -528,6 +575,10 @@ set(RR_SOURCES
   ${CMAKE_CURRENT_BINARY_DIR}/rr_trace.capnp.c++
   ${BLAKE_ARCH_DIR}/blake2b.c
 )
+
+if(PROC_SERVICE_H)
+  set(RR_SOURCES ${RR_SOURCES} src/ThreadDb.cc)
+endif()
 
 if (x86ish)
   set(RR_SOURCES ${RR_SOURCES} src/test/x86/cpuid_loop.S)
@@ -574,9 +625,13 @@ if(LOWERCASE_CMAKE_BUILD_TYPE STREQUAL "release")
   set(RR_MAIN_LINKER_FLAGS "${RR_MAIN_LINKER_FLAGS} -flto")
 endif()
 
+if(LIBRT)
+  target_link_libraries(rr ${LIBRT})
+endif()
+
 target_link_libraries(rr
   ${CMAKE_DL_LIBS}
-  -lrt
+  ${ZLIB_LDFLAGS}
   brotli
 )
 
@@ -592,11 +647,9 @@ endif()
 
 set_target_properties(rr PROPERTIES LINK_FLAGS "${RR_MAIN_LINKER_FLAGS}")
 
-if (x86ish)
 target_link_libraries(rrpreload
   ${CMAKE_DL_LIBS}
 )
-endif()
 
 add_executable(rr_exec_stub src/exec_stub.c)
 post_build_executable(rr_exec_stub)
@@ -650,6 +703,11 @@ foreach(file ${RR_PAGE_SOURCE_FILES})
   install(FILES src/preload/${file}
           DESTINATION ${CMAKE_INSTALL_DATADIR}/rr/src/preload)
 endforeach(file)
+configure_file("${CMAKE_CURRENT_BINARY_DIR}/src/preload/rr_page.ld"
+               "${CMAKE_CURRENT_BINARY_DIR}/share/rr/src/preload/rr_page.ld"
+               COPYONLY)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/src/preload/rr_page.ld"
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/rr/src/preload)
 
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/scripts/rr-collect-symbols.py"
                "${CMAKE_CURRENT_BINARY_DIR}/bin/rr-collect-symbols.py"
@@ -662,9 +720,9 @@ install(PROGRAMS scripts/signal-rr-recording.sh
 install(PROGRAMS scripts/rr_completion
   DESTINATION ${CMAKE_INSTALL_DATADIR}/bash-completion/completions RENAME rr)
 
-set(RR_INSTALL_LIBS rrpage rraudit rr_exec_stub)
-if (x86ish)
-  set(RR_INSTALL_LIBS rrpreload ${RR_INSTALL_LIBS})
+set(RR_INSTALL_LIBS rrpreload rrpage rr_exec_stub)
+if(RTLD_AUDIT)
+  set(RR_INSTALL_LIBS ${RR_INSTALL_LIBS} rraudit)
 endif()
 
 install(TARGETS rr DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -678,6 +736,7 @@ install(TARGETS ${RR_INSTALL_LIBS}
 # This sucks but I can't find a better way to get CMake to build
 # the same source file in two different ways.
 if(rr_32BIT AND rr_64BIT)
+  set(RR_INSTALL_LIBS_32 rrpreload_32 rrpage_32 rr_exec_stub_32)
   add_library(rrpage_32)
 
   foreach(file ${RR_PAGE_SOURCE_FILES})
@@ -693,12 +752,12 @@ if(rr_32BIT AND rr_64BIT)
   endforeach(file)
 
   set_target_properties(rrpage_32 PROPERTIES NO_SONAME ON)
-  set_target_properties(rrpage_32 PROPERTIES LINK_FLAGS "-m32 -Wl,-T -Wl,${CMAKE_SOURCE_DIR}/src/preload/rr_page.ld -Wl,--hash-style=both -nostartfiles -nostdlib -Wl,-soname,linux-vdso.so.1 ${LINKER_FLAGS}")
-  set_target_properties(rrpage_32 PROPERTIES LINK_DEPENDS ${CMAKE_SOURCE_DIR}/src/preload/rr_page.ld)
+  set_target_properties(rrpage_32 PROPERTIES LINK_FLAGS "-m32 -Wl,-T -Wl,${CMAKE_BINARY_DIR}/src/preload/rr_page.ld -Wl,--hash-style=both -nostartfiles -nostdlib -Wl,-soname,linux-vdso.so.1 ${LINKER_FLAGS}")
+  set_target_properties(rrpage_32 PROPERTIES LINK_DEPENDS ${CMAKE_BINARY_DIR}/src/preload/rr_page.ld)
   set_target_properties(rrpage_32 PROPERTIES LINKER_LANGUAGE C)
 
   add_custom_command(TARGET rrpage_32 POST_BUILD
-                    COMMAND ${CMAKE_SOURCE_DIR}/src/preload/tweak_librrpage.py $<TARGET_FILE:rrpage_32>)
+                    COMMAND ${CMAKE_SOURCE_DIR}/src/preload/tweak_librrpage.py $<TARGET_FILE:rrpage_32> ${PRELOAD_LIBRARY_PAGE_SIZE})
 
 
   add_library(rrpreload_32)
@@ -721,24 +780,28 @@ if(rr_32BIT AND rr_64BIT)
     ${CMAKE_DL_LIBS}
   )
 
-  add_library(rraudit_32)
+  if(RTLD_AUDIT)
+    add_library(rraudit_32)
 
-  foreach(file ${AUDIT_SOURCE_FILES})
-    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/audit/${file}"
-                   "${CMAKE_CURRENT_BINARY_DIR}/32/audit/${file}"
-                   COPYONLY)
-  endforeach(file)
+    foreach(file ${AUDIT_SOURCE_FILES})
+      configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/audit/${file}"
+                     "${CMAKE_CURRENT_BINARY_DIR}/32/audit/${file}"
+                     COPYONLY)
+    endforeach(file)
 
-  foreach(file ${AUDIT_FILES})
-    target_sources(rraudit_32 PUBLIC "${CMAKE_CURRENT_BINARY_DIR}/32/audit/${file}")
-    set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/32/audit/${file}"
-                                PROPERTIES COMPILE_FLAGS "-m32 ${PRELOAD_COMPILE_FLAGS}")
-  endforeach(file)
+    foreach(file ${AUDIT_FILES})
+      target_sources(rraudit_32 PUBLIC "${CMAKE_CURRENT_BINARY_DIR}/32/audit/${file}")
+      set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/32/audit/${file}"
+                                  PROPERTIES COMPILE_FLAGS "-m32 ${PRELOAD_COMPILE_FLAGS}")
+    endforeach(file)
 
-  set_target_properties(rraudit_32 PROPERTIES LINK_FLAGS "-m32 -nostartfiles ${LINKER_FLAGS}")
-  target_link_libraries(rraudit_32
-    ${CMAKE_DL_LIBS}
-  )
+    set_target_properties(rraudit_32 PROPERTIES LINK_FLAGS "-m32 -nostartfiles ${LINKER_FLAGS}")
+    target_link_libraries(rraudit_32
+      ${CMAKE_DL_LIBS}
+    )
+
+    set(RR_INSTALL_LIBS_32 ${RR_INSTALL_LIBS_32} rraudit_32)
+  endif()
 
   foreach(file exec_stub.c)
     configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/${file}"
@@ -753,7 +816,7 @@ if(rr_32BIT AND rr_64BIT)
   set_target_properties(rr_exec_stub_32
                         PROPERTIES LINK_FLAGS "-static -nostartfiles -nodefaultlibs -m32 ${LINKER_FLAGS}")
 
-  install(TARGETS rrpreload_32 rrpage_32 rraudit_32 rr_exec_stub_32
+  install(TARGETS ${RR_INSTALL_LIBS_32}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/rr
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}/rr)
@@ -817,6 +880,7 @@ set(BASIC_TESTS
   clone_untraced
   clone_vfork_pidfd
   cloned_sigmask
+  close_range
   constructor
   copy_file_range
   x86/cpuid_same_state
@@ -871,9 +935,11 @@ set(BASIC_TESTS
   fork_many
   futex_exit_race
   futex_exit_race_sigsegv
+  futex_invalid_op
   futex_pi
   futex_priorities
   futex_requeue
+  futex_restart_race
   gcrypt_rdrand
   getcpu
   getgroups
@@ -987,6 +1053,7 @@ set(BASIC_TESTS
   packet_mmap_disable
   pause
   perf_event
+  perf_event_mmap
   personality
   pid_ns_kill_child
   pid_ns_kill_child_threads
@@ -1117,6 +1184,7 @@ set(BASIC_TESTS
   sigprocmask_in_syscallbuf_sighandler
   sigprocmask_rr_sigs
   sigprocmask_syscallbuf
+  sigpwr
   sigqueueinfo
   x86/sigreturn
   sigreturn_reg
@@ -1157,6 +1225,7 @@ set(BASIC_TESTS
   syscallbuf_timeslice
   syscallbuf_timeslice2
   sysconf
+  sysconf_conf
   sysctl
   sysemu_singlestep
   x86/sysfs
@@ -1275,6 +1344,7 @@ set(TESTS_WITH_PROGRAM
   x86/fxregs
   getcwd
   gdb_bogus_breakpoint
+  gdb_qpasssignals
   goto_event
   hello
   hooks
@@ -1309,7 +1379,6 @@ set(TESTS_WITH_PROGRAM
   overflow_branch_counter
   patch_page_end
   x86/patch_40_80_f6_81
-  perf_event_mmap
   priority
   ptrace_remote_unmap
   read_big_struct
@@ -1326,8 +1395,10 @@ set(TESTS_WITH_PROGRAM
   rr_ps
   rr_ps_ns
   rseq
+  rseq_syscallbuf
   search
   seccomp_blocks_rr
+  seccomp_open
   seccomp_signals
   segfault
   shared_map
@@ -1355,6 +1426,7 @@ set(TESTS_WITH_PROGRAM
   tcp_sockets
   term_nonmain
   term_rr
+  term_rr_ok
   term_trace_reset
   term_trace_syscall
   thread_exit_signal
@@ -1481,6 +1553,8 @@ set(TESTS_WITHOUT_PROGRAM
   subprocess_exit_ends_session
   switch_processes
   syscallbuf_timeslice_250
+  tick0
+  tick0_less
   trace_version
   term_trace_cpu
   trace_events
@@ -1540,7 +1614,10 @@ if(BUILD_TESTS)
     set_source_files_properties(src/test/${test}.c
                                 PROPERTIES COMPILE_FLAGS ${RR_TEST_FLAGS})
     add_dependencies(${testname} Generated)
-    target_link_libraries(${testname} -lrt -ldl)
+    if(LIBRT)
+      target_link_libraries(${testname} ${LIBRT})
+    endif()
+    target_link_libraries(${testname} -ldl)
     # Part of the installable testsuite (test programs).
     if(INSTALL_TESTSUITE)
       install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/bin/${testname}
@@ -1548,12 +1625,24 @@ if(BUILD_TESTS)
     endif(INSTALL_TESTSUITE)
   endforeach(test)
 
+  add_executable(tick0 src/test/tick0.c)
+  post_build_executable(tick0)
+  set_target_properties(tick0
+    PROPERTIES LINK_FLAGS "-static -nostdlib -nodefaultlibs"
+    COMPILE_FLAGS "-static -nostdlib -nodefaultlibs -O3 -g2 -DHAS_TICK0=1")
+
+  add_executable(tick0_less src/test/tick0.c)
+  post_build_executable(tick0_less)
+  set_target_properties(tick0_less
+    PROPERTIES LINK_FLAGS "-static -nostdlib -nodefaultlibs"
+    COMPILE_FLAGS "-static -nostdlib -nodefaultlibs -O3 -g2")
+
   # Test disabled because it requires libuvc to be built and installed, and a
   # working USB camera
   # add_executable(usb src/test/usb.c)
   # post_build_executable(usb)
   # add_dependencies(usb Generated)
-  # target_link_libraries(usb -lrt -L/usr/local/lib -luvc -lusb-1.0)
+  # target_link_libraries(usb ${LIBRT} -L/usr/local/lib -luvc -lusb-1.0)
 
   foreach(test ${BASIC_CPP_TESTS})
     add_executable(${test} src/test/${test}.cc)
@@ -1561,7 +1650,9 @@ if(BUILD_TESTS)
     set_source_files_properties(src/test/${test}.cc
                                 PROPERTIES COMPILE_FLAGS ${RR_TEST_FLAGS})
     add_dependencies(${test} Generated)
-    target_link_libraries(${test} -lrt)
+    if(LIBRT)
+      target_link_libraries(${test} ${LIBRT})
+    endif()
     # Part of the installable testsuite (test programs).
     if(INSTALL_TESTSUITE)
       install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/bin/${test}
@@ -1575,7 +1666,10 @@ if(BUILD_TESTS)
   add_dependencies(test_lib Generated)
   set_source_files_properties(src/test/test_lib.c
                               PROPERTIES COMPILE_FLAGS ${RR_TEST_FLAGS})
-  target_link_libraries(constructor -lrt test_lib)
+  if(LIBRT)
+    target_link_libraries(constructor ${LIBRT})
+  endif()
+  target_link_libraries(constructor test_lib)
 
   # cpuid test needs to link with cpuid_loop.S
   if (x86ish)
@@ -1584,7 +1678,9 @@ if(BUILD_TESTS)
     set_source_files_properties(src/test/x86/cpuid.c
                                 PROPERTIES COMPILE_FLAGS ${RR_TEST_FLAGS})
     add_dependencies(cpuid Generated)
-    target_link_libraries(cpuid -lrt)
+    if(LIBRT)
+      target_link_libraries(cpuid ${LIBRT})
+    endif()
   endif()
 
   # Check if we're running on KNL. If so, we allot more time to tests, due to
@@ -1655,7 +1751,7 @@ if(BUILD_TESTS)
                     COPYONLY)
     endforeach(header)
 
-    foreach(test ${BASIC_TESTS} ${TESTS_WITH_PROGRAM} x86/cpuid test_lib)
+    foreach(test ${BASIC_TESTS} ${TESTS_WITH_PROGRAM} x86/cpuid test_lib tick0)
       configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/test/${test}.c"
                      "${CMAKE_CURRENT_BINARY_DIR}/32/${test}.c"
                      COPYONLY)
@@ -1690,7 +1786,10 @@ if(BUILD_TESTS)
       post_build_executable(${testname}_32)
       add_dependencies(${testname}_32 Generated)
       set_target_properties(${testname}_32 PROPERTIES LINK_FLAGS "-m32 ${RR_TEST_FLAGS} ${LINKER_FLAGS}")
-      target_link_libraries(${testname}_32 -lrt -ldl)
+      if(LIBRT)
+        target_link_libraries(${testname}_32 ${LIBRT})
+      endif()
+      target_link_libraries(${testname}_32 -ldl)
       # Part of the installable testsuite (test programs).
       if (INSTALL_TESTSUITE)
         install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/bin/${testname}_32
@@ -1698,20 +1797,37 @@ if(BUILD_TESTS)
       endif (INSTALL_TESTSUITE)
     endforeach(test)
 
+    add_executable(tick0_32 "${CMAKE_CURRENT_BINARY_DIR}/32/tick0.c")
+    post_build_executable(tick0_32)
+    set_target_properties(tick0_32
+      PROPERTIES LINK_FLAGS "-m32 -static -nostdlib -nodefaultlibs"
+      COMPILE_FLAGS "-m32 -static -nostdlib -nodefaultlibs -O3 -g2 -DHAS_TICK0=1")
+
+    add_executable(tick0_less_32 "${CMAKE_CURRENT_BINARY_DIR}/32/tick0.c")
+    post_build_executable(tick0_less_32)
+    set_target_properties(tick0_less_32
+      PROPERTIES LINK_FLAGS "-m32 -static -nostdlib -nodefaultlibs"
+      COMPILE_FLAGS "-m32 -static -nostdlib -nodefaultlibs -O3 -g2")
+
     add_library(test_lib_32
       "${CMAKE_CURRENT_BINARY_DIR}/32/test_lib.c"
     )
     add_dependencies(test_lib_32 Generated)
     set_target_properties(test_lib_32 PROPERTIES LINK_FLAGS "-m32 ${LINKER_FLAGS}")
 
-    target_link_libraries(constructor_32 -lrt test_lib_32)
+    if(LIBRT)
+      target_link_libraries(constructor_32 ${LIBRT})
+    endif()
+    target_link_libraries(constructor_32 test_lib_32)
 
     # cpuid test needs to link with cpuid_loop.S
     add_executable(cpuid_32 32/x86/cpuid.c 32/x86/cpuid_loop.S)
     post_build_executable(cpuid_32)
     add_dependencies(cpuid_32 Generated)
     set_target_properties(cpuid_32 PROPERTIES LINK_FLAGS "-m32 ${LINKER_FLAGS}")
-    target_link_libraries(cpuid_32 -lrt)
+    if(LIBRT)
+      target_link_libraries(cpuid_32 ${LIBRT})
+    endif()
 
     if(INSTALL_TESTSUITE)
       install(TARGETS test_lib_32
@@ -1755,7 +1871,9 @@ if(BUILD_TESTS)
   foreach(test ${CHAOS_TESTS})
     add_executable(${test} src/chaos-test/${test}.c)
     post_build_executable(${test})
-    target_link_libraries(${test} -lrt)
+    if(LIBRT)
+      target_link_libraries(${test} ${LIBRT})
+    endif()
   endforeach(test)
 
   add_executable(test-monitor src/test-monitor/test-monitor.cc)
@@ -1824,8 +1942,3 @@ set(CPACK_RPM_PACKAGE_LICENSE "MIT and BSD")
 set(CPACK_RPM_SPEC_INSTALL_POST "/bin/true")
 
 include (CPack)
-
-##--------------------------------------------------
-## Misc
-
-add_custom_target(setup-travis COMMAND src/script/setup_travis.sh)

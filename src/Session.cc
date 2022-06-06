@@ -249,7 +249,7 @@ ScopedFd Session::create_spawn_task_error_pipe() {
   if (0 != pipe2(fds, O_CLOEXEC)) {
     FATAL();
   }
-  spawned_task_error_fd_ = fds[0];
+  spawned_task_error_fd_ = ScopedFd(fds[0]);
   return ScopedFd(fds[1]);
 }
 
@@ -399,19 +399,32 @@ static void remap_shared_mmap(AutoRemoteSyscalls& remote, EmuFs& emu_fs,
 
   // TODO: this duplicates some code in replay_syscall.cc, but
   // it's somewhat nontrivial to factor that code out.
-  int remote_fd = remote.send_fd(emu_file->fd());
-  ASSERT(remote.task(), remote_fd >= 0);
+  int remote_fd = remote.infallible_send_fd_if_alive(emu_file->fd());
+  if (remote_fd < 0) {
+    if (remote.task()->vm()->task_set().size() > remote.task()->thread_group()->task_set().size()) {
+      // XXX not sure how to handle the case where the tracee died after
+      // we unmapped the area
+      FATAL() << "Unexpected task death leaving this address space in a bad state";
+    }
+    return;
+  }
   struct stat real_file = remote.task()->stat_fd(remote_fd);
   string real_file_name = remote.task()->file_name_of_fd(remote_fd);
   // XXX this condition is x86/x64-specific, I imagine.
-  remote.infallible_mmap_syscall(m.map.start(), m.map.size(), m.map.prot(),
-                                 // The remapped segment *must* be
-                                 // remapped at the same address,
-                                 // or else many things will go
-                                 // haywire.
-                                 (m.map.flags() & ~MAP_ANONYMOUS) | MAP_FIXED,
-                                 remote_fd,
-                                 m.map.file_offset_bytes() / page_size());
+  // The remapped segment *must* be remapped at the same address,
+  // or else many things will go haywire.
+  auto ret = remote.infallible_mmap_syscall_if_alive(m.map.start(), m.map.size(), m.map.prot(),
+                                                     (m.map.flags() & ~MAP_ANONYMOUS) | MAP_FIXED,
+                                                     remote_fd,
+                                                     m.map.file_offset_bytes());
+  if (!ret) {
+    if (remote.task()->vm()->task_set().size() > remote.task()->thread_group()->task_set().size()) {
+      // XXX not sure how to handle the case where the tracee died after
+      // we unmapped the area
+      FATAL() << "Unexpected task death leaving this address space in a bad state";
+    }
+    return;
+  }
 
   // We update the AddressSpace mapping too, since that tracks the real file
   // name and we need to update that.
@@ -420,7 +433,7 @@ static void remap_shared_mmap(AutoRemoteSyscalls& remote, EmuFs& emu_fs,
       m.map.file_offset_bytes(), real_file_name, real_file.st_dev,
       real_file.st_ino, nullptr, &m.recorded_map, emu_file);
 
-  remote.infallible_syscall(syscall_number_for_close(remote.arch()), remote_fd);
+  remote.infallible_close_syscall_if_alive(remote_fd);
 }
 
 /*static*/ const char* Session::rr_mapping_prefix() { return "/rr-shared-"; }
@@ -441,34 +454,41 @@ KernelMapping Session::create_shared_mmap(
    * cleaning up this segment in error conditions. */
   unlink(path);
 
-  int child_shmem_fd = remote.send_fd(shmem_fd);
-  ASSERT(remote.task(), child_shmem_fd >= 0);
-  resize_shmem_segment(shmem_fd, size);
+  KernelMapping km;
+  int child_shmem_fd = remote.infallible_send_fd_if_alive(shmem_fd);
+  if (child_shmem_fd < 0) {
+    return km;
+  }
   LOG(debug) << "created shmem segment " << path;
 
   // Map the segment in ours and the tracee's address spaces.
   void* map_addr;
   int flags = MAP_SHARED;
-  if ((void*)-1 == (map_addr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
-                                    flags, shmem_fd, 0))) {
-    FATAL() << "Failed to mmap shmem region";
-  }
   if (!map_hint.is_null()) {
     flags |= MAP_FIXED;
   }
-  remote_ptr<void> child_map_addr = remote.infallible_mmap_syscall(
+  remote_ptr<void> child_map_addr = remote.infallible_mmap_syscall_if_alive(
       map_hint, size, tracee_prot, flags, child_shmem_fd, 0);
+  if (!child_map_addr) {
+    // tracee unexpectedly died
+    return km;
+  }
+
+  if ((void*)-1 == (map_addr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                                    MAP_SHARED, shmem_fd, 0))) {
+    FATAL() << "Failed to mmap shmem region";
+  }
+  resize_shmem_segment(shmem_fd, size);
 
   struct stat st;
   ASSERT(remote.task(), 0 == ::fstat(shmem_fd, &st));
-  KernelMapping km = remote.task()->vm()->map(
+  km = remote.task()->vm()->map(
       remote.task(), child_map_addr, size, tracee_prot, flags | tracee_flags, 0,
       path, st.st_dev, st.st_ino, nullptr, nullptr, nullptr, map_addr,
       std::move(monitored));
 
   shmem_fd.close();
-  remote.infallible_syscall(syscall_number_for_close(remote.arch()),
-                            child_shmem_fd);
+  remote.infallible_close_syscall_if_alive(child_shmem_fd);
   return km;
 }
 
@@ -504,7 +524,7 @@ static char* extract_name(char* name_buffer, size_t buffer_size) {
   return name_start;
 }
 
-const AddressSpace::Mapping& Session::recreate_shared_mmap(
+const AddressSpace::Mapping Session::recreate_shared_mmap(
     AutoRemoteSyscalls& remote, const AddressSpace::Mapping& m,
     PreserveContents preserve, MonitoredSharedMemory::shr_ptr&& monitored) {
   char name[PATH_MAX];
@@ -521,12 +541,15 @@ const AddressSpace::Mapping& Session::recreate_shared_mmap(
                          extract_name(name, sizeof(name)), m.map.prot(), 0,
                          std::move(monitored))
           .start();
-  // m may be invalid now
-  remote.task()->vm()->mapping_flags_of(new_addr) = flags;
-  auto& new_map = remote.task()->vm()->mapping_of(new_addr);
-  if (preserved_data) {
-    memcpy(new_map.local_addr, preserved_data, size);
-    munmap(preserved_data, size);
+  AddressSpace::Mapping new_map;
+  if (new_addr) {
+    // m may be invalid now
+    remote.task()->vm()->mapping_flags_of(new_addr) = flags;
+    new_map = remote.task()->vm()->mapping_of(new_addr);
+    if (preserved_data) {
+      memcpy(new_map.local_addr, preserved_data, size);
+      munmap(preserved_data, size);
+    }
   }
   return new_map;
 }
@@ -557,11 +580,11 @@ const AddressSpace::Mapping& Session::steal_mapping(
 }
 
 // Replace a MAP_PRIVATE segment by one that is shared between rr and the
-// tracee. Returns true on success
-bool Session::make_private_shared(AutoRemoteSyscalls& remote,
+// tracee.
+void Session::make_private_shared(AutoRemoteSyscalls& remote,
                                   const AddressSpace::Mapping m) {
   if (!(m.map.flags() & MAP_PRIVATE)) {
-    return false;
+    return;
   }
   // Find a place to map the current segment to temporarily
   remote_ptr<void> start = m.map.start();
@@ -577,6 +600,9 @@ bool Session::make_private_shared(AutoRemoteSyscalls& remote,
 
   const AddressSpace::Mapping& new_m = steal_mapping(remote2, m);
 
+  if (!new_m.local_addr) {
+    return;
+  }
   // And copy over the contents. Since we can't just call memcpy in the
   // inferior, just copy directly from the remote private into the local
   // reference of the shared mapping. We use the fallible read method to
@@ -588,7 +614,6 @@ bool Session::make_private_shared(AutoRemoteSyscalls& remote,
   remote2.infallible_syscall(syscall_number_for_munmap(remote.arch()), free_mem,
                              sz);
   remote.task()->vm()->unmap(remote.task(), free_mem, sz);
-  return true;
 }
 
 static vector<uint8_t> capture_syscallbuf(const AddressSpace::Mapping& m,
@@ -688,8 +713,8 @@ bool Session::has_cpuid_faulting() {
   return !Flags::get().disable_cpuid_faulting && cpuid_faulting_works();
 }
 
-int Session::cpu_binding(TraceStream& trace) const {
-  return trace.bound_to_cpu();
+int Session::cpu_binding() const {
+  return const_cast<Session*>(this)->trace_stream()->bound_to_cpu();
 }
 
 // Returns true if we succeeded, false if we failed because the
@@ -709,8 +734,8 @@ static bool set_cpu_affinity(int cpu) {
   return true;
 }
 
-void Session::do_bind_cpu(TraceStream &trace) {
-  int cpu_index = this->cpu_binding(trace);
+void Session::do_bind_cpu() {
+  int cpu_index = this->cpu_binding();
   if (cpu_index >= 0) {
     // Set CPU affinity now, after we've created any helper threads
     // (so they aren't affected), but before we create any
@@ -725,14 +750,17 @@ void Session::do_bind_cpu(TraceStream &trace) {
                   << " even after we re-selected it";
         }
         LOG(warn) << "Bound to CPU " << cpu_index
-                  << "instead of selected " << trace.bound_to_cpu()
+                  << "instead of selected " << trace_stream()->bound_to_cpu()
                   << "because the latter is not available;\n"
                   << "Hoping tracee doesn't use LSL instruction!";
-        trace.set_bound_cpu(cpu_index);
+        trace_stream()->set_bound_cpu(cpu_index);
       } else {
         FATAL() << "Can't bind to requested CPU " << cpu_index
                 << ", and CPUID faulting not available";
       }
+    } else if (!is_recording()) {
+      // Make sure to mark this CPU as in use in the cpu_lock.
+      (void)choose_cpu((BindCPU)cpu_index, cpu_lock);
     }
   }
 }

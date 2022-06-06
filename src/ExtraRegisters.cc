@@ -155,13 +155,22 @@ static RegData xsave_register_data(SupportedArch arch, GdbRegister regno) {
   return RegData(fxsave_387_ctrl_offsets[regno - DREG_64_FCTRL], 4);
 }
 
-static uint64_t xsave_features(const vector<uint8_t>& data) {
+static const uint64_t* xsave_features(const vector<uint8_t>& data) {
   // If this is just FXSAVE(64) data then we we have no XSAVE header and no
   // XSAVE(64) features enabled.
   return data.size() < xsave_header_offset + xsave_header_size
-             ? 0
-             : *reinterpret_cast<const uint64_t*>(data.data() +
-                                                  xsave_header_offset);
+             ? nullptr
+             : reinterpret_cast<const uint64_t*>(data.data() +
+                                                 xsave_header_offset);
+
+}
+
+static uint64_t* xsave_features(vector<uint8_t>& data) {
+  // If this is just FXSAVE(64) data then we we have no XSAVE header and no
+  // XSAVE(64) features enabled.
+  return data.size() < xsave_header_offset + xsave_header_size
+             ? nullptr
+             : reinterpret_cast<uint64_t*>(data.data() + xsave_header_offset);
 }
 
 size_t ExtraRegisters::read_register(uint8_t* buf, GdbRegister regno,
@@ -210,14 +219,77 @@ size_t ExtraRegisters::read_register(uint8_t* buf, GdbRegister regno,
 
   // Apparently before any AVX registers are used, the feature bit is not set
   // in the XSAVE data, so we'll just return 0 for them here.
-  if (reg_data.xsave_feature_bit >= 0 &&
-      !(xsave_features(data_) & (1 << reg_data.xsave_feature_bit))) {
+  const uint64_t* xsave_features_ = xsave_features(data_);
+  if (reg_data.xsave_feature_bit >= 0 && xsave_features_ &&
+      !(*xsave_features_ & (1 << reg_data.xsave_feature_bit))) {
     memset(buf, 0, reg_data.size);
   } else {
     DEBUG_ASSERT(size_t(reg_data.offset + reg_data.size) <= data_.size());
     memcpy(buf, data_.data() + reg_data.offset, reg_data.size);
   }
   return reg_data.size;
+}
+
+bool ExtraRegisters::write_register(GdbRegister regno, const void* value,
+                                    size_t value_size) {
+  if (format_ == NT_FPR) {
+    if (arch() != aarch64) {
+      return false;
+    }
+
+    RegData reg_data;
+    if (DREG_V0 <= regno && regno <= DREG_V31) {
+      reg_data = RegData(offsetof(ARM64Arch::user_fpsimd_state, vregs[0]) +
+        ((regno - DREG_V0) * 16), 16);
+    } else if (regno == DREG_FPSR) {
+      reg_data = RegData(offsetof(ARM64Arch::user_fpsimd_state, fpsr),
+                         sizeof(uint32_t));
+    } else if (regno == DREG_FPCR) {
+      reg_data = RegData(offsetof(ARM64Arch::user_fpsimd_state, fpcr),
+                         sizeof(uint32_t));
+    } else {
+      return false;
+    }
+
+    DEBUG_ASSERT(reg_data.size > 0);
+    if ((size_t)reg_data.size != value_size) {
+      LOG(warn) << "Register " << regno << "has mismatched sizes ("
+                << reg_data.size << " vs " << value_size << ")";
+      return false;
+    }
+
+    DEBUG_ASSERT(size_t(reg_data.offset + reg_data.size) <= data_.size());
+    memcpy(data_.data() + reg_data.offset, value, value_size);
+    return true;
+  }
+
+  if (format_ != XSAVE) {
+    return false;
+  }
+
+  auto reg_data = xsave_register_data(arch(), regno);
+  if (reg_data.offset < 0 || empty()) {
+    return false;
+  }
+
+  DEBUG_ASSERT(reg_data.size > 0);
+  if ((size_t)reg_data.size != value_size) {
+    LOG(warn) << "Register " << regno << "has mismatched sizes ("
+              << reg_data.size << " vs " << value_size << ")";
+    return false;
+  }
+
+  if (reg_data.xsave_feature_bit >= 0) {
+    uint64_t* xsave_features_ = xsave_features(data_);
+    if (!xsave_features_) {
+      return false;
+    }
+
+    *xsave_features_ |= (1 << reg_data.xsave_feature_bit);
+  }
+
+  memcpy(data_.data() + reg_data.offset, value, value_size);
+  return true;
 }
 
 static const int xinuse_offset = 512;
@@ -296,8 +368,8 @@ void ExtraRegisters::validate(Task* t) {
   if (data_.size() > offset) {
     ASSERT(t, data_.size() >= offset + 64);
     offset += 64;
-    uint64_t features = xsave_features(data_);
-    if (features & (1 << AVX_FEATURE_BIT)) {
+    const uint64_t* features = xsave_features(data_);
+    if (features && (*features & (1 << AVX_FEATURE_BIT))) {
       ASSERT(t, data_.size() >= offset + 256);
     }
   }
@@ -572,7 +644,6 @@ bool ExtraRegisters::set_to_raw_data(SupportedArch a, Format format,
 
 vector<uint8_t> ExtraRegisters::get_user_fpregs_struct(
     SupportedArch arch) const {
-  DEBUG_ASSERT(format_ == XSAVE);
   switch (arch) {
     case x86:
       DEBUG_ASSERT(format_ == XSAVE);
@@ -598,9 +669,9 @@ vector<uint8_t> ExtraRegisters::get_user_fpregs_struct(
 
 void ExtraRegisters::set_user_fpregs_struct(Task* t, SupportedArch arch,
                                             void* data, size_t size) {
-  DEBUG_ASSERT(format_ == XSAVE);
   switch (arch) {
     case x86:
+      DEBUG_ASSERT(format_ == XSAVE);
       ASSERT(t, size >= sizeof(X86Arch::user_fpregs_struct));
       ASSERT(t, data_.size() >= sizeof(X86Arch::user_fpxregs_struct));
       convert_x86_fpregs_to_fxsave(
@@ -608,9 +679,16 @@ void ExtraRegisters::set_user_fpregs_struct(Task* t, SupportedArch arch,
           reinterpret_cast<X86Arch::user_fpxregs_struct*>(data_.data()));
       return;
     case x86_64:
+      DEBUG_ASSERT(format_ == XSAVE);
       ASSERT(t, data_.size() >= sizeof(X64Arch::user_fpregs_struct));
       ASSERT(t, size >= sizeof(X64Arch::user_fpregs_struct));
       memcpy(data_.data(), data, sizeof(X64Arch::user_fpregs_struct));
+      return;
+    case aarch64:
+      DEBUG_ASSERT(format_ == NT_FPR);
+      ASSERT(t, size >= sizeof(ARM64Arch::user_fpregs_struct));
+      ASSERT(t, data_.size() >= sizeof(ARM64Arch::user_fpregs_struct));
+      memcpy(data_.data(), data, sizeof(ARM64Arch::user_fpregs_struct));
       return;
     default:
       DEBUG_ASSERT(0 && "Unknown arch");

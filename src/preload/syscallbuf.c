@@ -47,6 +47,7 @@
 
 #include <dlfcn.h>
 #include <limits.h>
+#include <unistd.h>
 #include <asm/errno.h>
 #include <asm/ioctls.h>
 #include <asm/poll.h>
@@ -78,7 +79,6 @@
 #include <stdio.h>
 #include <syscall.h>
 #include <sysexits.h>
-#include <unistd.h>
 
 #include "preload_interface.h"
 #include "rr/rr.h"
@@ -146,13 +146,6 @@ static int buffer_enabled;
 static int process_inited;
 
 RR_HIDDEN struct preload_globals globals;
-RR_HIDDEN char impose_syscall_delay;
-RR_HIDDEN char impose_spurious_desched;
-RR_HIDDEN int (*real_pthread_mutex_init)(void* mutex, const void* attr);
-RR_HIDDEN int (*real_pthread_mutex_lock)(void* mutex);
-RR_HIDDEN int (*real_pthread_mutex_trylock)(void* mutex);
-RR_HIDDEN int (*real_pthread_mutex_timedlock)(void* mutex,
-                                              const struct timespec* abstime);
 
 static struct preload_thread_locals* const thread_locals =
     (struct preload_thread_locals*)PRELOAD_THREAD_LOCALS_ADDR;
@@ -666,6 +659,8 @@ static void __attribute__((constructor)) init_process(void) {
   extern RR_HIDDEN void _syscall_hook_trampoline_48_3d_01_f0_ff_ff(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_48_3d_00_f0_ff_ff(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_48_8b_3c_24(void);
+  extern RR_HIDDEN void _syscall_hook_trampoline_48_89_45_f8(void);
+  extern RR_HIDDEN void _syscall_hook_trampoline_48_89_c3(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_5a_5e_c3(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_89_c2_f7_da(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_90_90_90(void);
@@ -697,6 +692,20 @@ static void __attribute__((constructor)) init_process(void) {
       4,
       { 0x48, 0x8b, 0x3c, 0x24 },
       (uintptr_t)_syscall_hook_trampoline_48_8b_3c_24 },
+    /* Some syscall wrappers have 'syscall' followed
+     * by
+     * mov %rax,-8(%rbp) */
+    { 0,
+      4,
+      { 0x48, 0x89, 0x45, 0xf8 },
+      (uintptr_t)_syscall_hook_trampoline_48_89_45_f8 },
+    /* Some syscall wrappers (e.g. read) have 'syscall' followed
+     * by
+     * mov %rax,%rbx */
+    { 0,
+      3,
+      { 0x48, 0x89, 0xc3 },
+      (uintptr_t)_syscall_hook_trampoline_48_89_c3 },
     /* __lll_unlock_wake has 'syscall' followed by
      * pop %rdx; pop %rsi; ret */
     { PATCH_IS_MULTIPLE_INSTRUCTIONS,
@@ -783,8 +792,9 @@ static void __attribute__((constructor)) init_process(void) {
 
   // Check if the rr page is mapped. We avoid a syscall if it looks like
   // rr places librrpage as the vdso
-  if ((!getauxval || (getauxval(AT_SYSINFO_EHDR) != RR_PAGE_ADDR - 3*RR_PAGE_SIZE)) &&
-      msync((void*)RR_PAGE_ADDR, RR_PAGE_SIZE, MS_ASYNC) != 0) {
+  // Use 1 as size since linux implementation of msync round it up to page size
+  if ((!getauxval || (getauxval(AT_SYSINFO_EHDR) != RR_PAGE_ADDR - 3*PRELOAD_LIBRARY_PAGE_SIZE)) &&
+      msync((void*)RR_PAGE_ADDR, 1, MS_ASYNC) != 0) {
     // The RR page is not mapped - this process is not rr traced.
     buffer_enabled = 0;
     return;
@@ -824,7 +834,6 @@ static void __attribute__((constructor)) init_process(void) {
   params.breakpoint_mode_sentinel = -1;
   params.syscallbuf_syscall_hook = (void*)syscall_hook;
 
-  privileged_traced_syscall1(SYS_rrcall_init_preload, &params);
   int err = privileged_traced_syscall1(SYS_rrcall_init_preload, &params);
   if (err != 0) {
     // Check if the rr tracer is present by looking for the thread local page
@@ -832,7 +841,8 @@ static void __attribute__((constructor)) init_process(void) {
     // preloaded without rr listening, which is allowed (e.g. after detach).
     // Otherwise give an intelligent error message indicating that our connection
     // to rr is broken.
-    if (msync((void*)RR_PAGE_ADDR + RR_PAGE_SIZE, RR_PAGE_SIZE, MS_ASYNC) == 0) {
+    // Use 1 as size since linux implementation of msync round it up to page size
+    if (msync((void*)RR_PAGE_ADDR + PRELOAD_LIBRARY_PAGE_SIZE, 1, MS_ASYNC) == 0) {
       fatal("Failed to communicated with rr tracer.\n"
             "Perhaps a restrictive seccomp filter is in effect (e.g. docker?)?\n"
             "Adjust the seccomp filter to allow syscalls above 1000, disable it,\n"
@@ -842,11 +852,6 @@ static void __attribute__((constructor)) init_process(void) {
       return;
     }
   }
-
-  real_pthread_mutex_init = dlsym(RTLD_NEXT, "pthread_mutex_init");
-  real_pthread_mutex_lock = dlsym(RTLD_NEXT, "pthread_mutex_lock");
-  real_pthread_mutex_trylock = dlsym(RTLD_NEXT, "pthread_mutex_trylock");
-  real_pthread_mutex_timedlock = dlsym(RTLD_NEXT, "pthread_mutex_timedlock");
 
   process_inited = 1;
 }
@@ -1412,11 +1417,8 @@ static long sys_creat(const struct syscall_info* call) {
    *
    *   creat() is equivalent to open() with flags equal to
    *   O_CREAT|O_WRONLY|O_TRUNC. */
-  struct syscall_info open_call;
-  open_call.no = SYS_open;
-  open_call.args[0] = (long)pathname;
-  open_call.args[1] = O_CREAT | O_TRUNC | O_WRONLY;
-  open_call.args[2] = mode;
+  struct syscall_info open_call =
+    { SYS_open, { (long)pathname, O_CREAT | O_TRUNC | O_WRONLY, mode } };
   return sys_open(&open_call);
 }
 #endif
@@ -2072,16 +2074,30 @@ static int supported_open(const char* file_name, int flags) {
 
 static long sys_readlinkat(const struct syscall_info* call, int privileged);
 
-static int check_file_open_ok(const struct syscall_info* call, int ret, int did_abort) {
-  if (did_abort || ret < 0) {
+struct check_open_state {
+  uint8_t did_abort;
+  uint8_t did_fail_during_preparation;
+};
+
+static int check_file_open_ok(const struct syscall_info* call, int ret, struct check_open_state state) {
+  /* If we failed during preparation then a SIGSYS or similar prevented the syscall
+     from doing anything, so there is nothing for us to do here and we shouldn't
+     try to interpret the "syscall result". */
+  if (state.did_fail_during_preparation || ret < 0) {
     return ret;
   }
   char buf[100];
   sprintf(buf, "/proc/self/fd/%d", ret);
   char link[PATH_MAX];
-  struct syscall_info readlink_call =
-    { SYS_readlinkat, { -1, (long)buf, (long)link, sizeof(link), 0, 0 } };
-  long link_ret = sys_readlinkat(&readlink_call, 1);
+  long link_ret;
+  if (state.did_abort) {
+    /* Don't add any new syscallbuf records, that won't work. */
+    link_ret = privileged_traced_syscall4(SYS_readlinkat, -1, (long)buf, (long)link, sizeof(link));
+  } else {
+    struct syscall_info readlink_call =
+      { SYS_readlinkat, { -1, (long)buf, (long)link, sizeof(link), 0, 0 } };
+    link_ret = sys_readlinkat(&readlink_call, 1);
+  }
   if (link_ret >= 0 && link_ret < (ssize_t)sizeof(link)) {
     link[link_ret] = 0;
     if (allow_buffered_open(link)) {
@@ -2092,11 +2108,19 @@ static int check_file_open_ok(const struct syscall_info* call, int ret, int did_
      opening it again, traced this time.
      Use a privileged traced syscall for the close to ensure it
      can't fail due to lack of privilege.
+     We expect this to return an error.
      We could try an untraced close syscall here, falling back to traced
      syscall, but that's a bit more complicated and we're already on
      the slow (and hopefully rare) path. */
   privileged_traced_syscall1(SYS_close, ret);
   return traced_raw_syscall(call);
+}
+
+static struct check_open_state capture_check_open_state(void) {
+  struct check_open_state ret;
+  ret.did_abort = buffer_hdr()->abort_commit;
+  ret.did_fail_during_preparation = buffer_hdr()->failed_during_preparation;
+  return ret;
 }
 
 #if defined(SYS_open)
@@ -2125,9 +2149,9 @@ static long sys_open(const struct syscall_info* call) {
   }
 
   ret = untraced_syscall3(syscallno, pathname, flags, mode);
-  int did_abort = buffer_hdr()->abort_commit;
+  struct check_open_state state = capture_check_open_state();
   ret = commit_raw_syscall(syscallno, ptr, ret);
-  return check_file_open_ok(call, ret, did_abort);
+  return check_file_open_ok(call, ret, state);
 }
 #endif
 
@@ -2157,9 +2181,9 @@ static long sys_openat(const struct syscall_info* call) {
   }
 
   ret = untraced_syscall4(syscallno, dirfd, pathname, flags, mode);
-  int did_abort = buffer_hdr()->abort_commit;
+  struct check_open_state state = capture_check_open_state();
   ret = commit_raw_syscall(syscallno, ptr, ret);
-  return check_file_open_ok(call, ret, did_abort);
+  return check_file_open_ok(call, ret, state);
 }
 
 #if defined(SYS_poll)

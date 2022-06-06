@@ -306,33 +306,34 @@ void AddressSpace::map_rr_page(AutoRemoteSyscalls& remote) {
   path += fname;
   size_t offset_pages = t->session().is_recording() ?
     RRPAGE_RECORD_PAGE_OFFSET : RRPAGE_REPLAY_PAGE_OFFSET;
-  size_t offset_bytes = offset_pages*rr_page_size();
+  size_t offset_bytes = offset_pages * PRELOAD_LIBRARY_PAGE_SIZE;
 
   {
     ScopedFd page(path.c_str(), O_RDONLY);
     ASSERT(t, page.is_open()) << "Failed to open rrpage library " << path;
-    long child_fd = remote.send_fd(page.get());
-    ASSERT(t, child_fd >= 0);
-    if (t->session().is_recording()) {
-      remote.infallible_mmap_syscall(rr_page_start() - offset_bytes, offset_bytes, prot, flags,
-                                    child_fd, 0);
-    }
-    remote.infallible_mmap_syscall(rr_page_start(), rr_page_size(), prot, flags,
-                                   child_fd, offset_pages);
+    int child_fd = remote.infallible_send_fd_if_alive(page);
+    if (child_fd >= 0) {
+      if (t->session().is_recording()) {
+        remote.infallible_mmap_syscall_if_alive(rr_page_start() - offset_bytes, offset_bytes, prot, flags,
+                                                child_fd, 0);
+      }
+      remote.infallible_mmap_syscall_if_alive(rr_page_start(), PRELOAD_LIBRARY_PAGE_SIZE, prot, flags,
+                                              child_fd, offset_bytes);
 
-    struct stat fstat = t->stat_fd(child_fd);
-    file_name = t->file_name_of_fd(child_fd);
+      struct stat fstat = t->stat_fd(child_fd);
+      file_name = t->file_name_of_fd(child_fd);
 
-    remote.infallible_syscall(syscall_number_for_close(arch), child_fd);
+      remote.infallible_close_syscall_if_alive(child_fd);
 
-    map(t, rr_page_start(), rr_page_size(), prot, flags,
-        offset_pages * page_size(), file_name,
-        fstat.st_dev, fstat.st_ino);
-    mapping_flags_of(rr_page_start()) = Mapping::IS_RR_PAGE;
-    if (t->session().is_recording()) {
-      map(t, rr_page_start() - offset_bytes, offset_bytes, prot, flags,
-          0, file_name,
+      map(t, rr_page_start(), PRELOAD_LIBRARY_PAGE_SIZE, prot, flags,
+          offset_bytes, file_name,
           fstat.st_dev, fstat.st_ino);
+      mapping_flags_of(rr_page_start()) = Mapping::IS_RR_PAGE;
+      if (t->session().is_recording()) {
+        map(t, rr_page_start() - offset_bytes, offset_bytes, prot, flags,
+            0, file_name,
+            fstat.st_dev, fstat.st_ino);
+      }
     }
   }
 
@@ -777,7 +778,7 @@ KernelMapping AddressSpace::map(Task* t, remote_ptr<void> addr,
 
 template <typename Arch> void AddressSpace::at_preload_init_arch(Task* t) {
   auto params = t->read_mem(
-      remote_ptr<rrcall_init_preload_params<Arch>>(t->regs().arg1()));
+      remote_ptr<rrcall_init_preload_params<Arch>>(t->regs().orig_arg1()));
 
   if (t->session().is_recording()) {
     ASSERT(t,
@@ -1545,7 +1546,7 @@ void AddressSpace::ensure_replay_matches_single_recorded_mapping(Task* t, Memory
       t->read_bytes_helper(mapping.map.start(), buffer.size(), buffer.data());
       {
         AutoRemoteSyscalls remote(t);
-        remote.infallible_mmap_syscall(mapping.map.start(), buffer.size(),
+        remote.infallible_mmap_syscall_if_alive(mapping.map.start(), buffer.size(),
             mapping.map.prot(), mapping.map.flags() | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
       }
       t->write_bytes_helper(mapping.map.start(), buffer.size(), buffer.data());
@@ -1622,6 +1623,7 @@ extern "C" {
 extern char rr_syscall_addr __attribute__ ((visibility ("hidden")));
 }
 static void __attribute__((noinline, used)) fake_syscall() {
+  __asm__ __volatile__(".global rr_syscall_addr\n\t");
 #ifdef __i386__
   __asm__ __volatile__("rr_syscall_addr: int $0x80\n\t"
                        "nop\n\t"
@@ -2146,20 +2148,34 @@ static MemoryRange adjust_range_for_stack_growth(const KernelMapping& km) {
   return MemoryRange(start, km.end());
 }
 
-static bool overlaps_asan_usage(const MemoryRange& r) {
-  MemoryRange asan_shadow(remote_ptr<void>((uintptr_t)0x00007fff7000LL),
-                          remote_ptr<void>((uintptr_t)0x10007fff8000LL));
-  MemoryRange asan_allocator_reserved(remote_ptr<void>((uintptr_t)0x600000000000LL),
-                                      remote_ptr<void>((uintptr_t)0x640000000000LL));
-  return r.intersects(asan_shadow) || r.intersects(asan_allocator_reserved);
+static bool overlaps_excluded_range(const RecordSession& session, MemoryRange range) {
+  for (const auto& r : session.excluded_ranges()) {
+    if (r.intersects(range)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool is_all_memory_excluded(const RecordSession& session) {
+  for (const auto& r : session.excluded_ranges()) {
+    if (r == MemoryRange::all()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Choose a 4TB range to exclude from random mappings. This makes room for
 // advanced trace analysis tools that require a large address range in tracees
 // that is never mapped.
-static MemoryRange choose_global_exclusion_range() {
-  if (sizeof(uintptr_t) < 8) {
+static MemoryRange choose_global_exclusion_range(const RecordSession* session) {
+  if (session && is_all_memory_excluded(*session)) {
     return MemoryRange(nullptr, 0);
+  }
+  if (session && session->fixed_global_exclusion_range().size()) {
+    // For TSAN we have a hardcoded range stored in the session.
+    return session->fixed_global_exclusion_range();
   }
 
   const uint64_t range_size = uint64_t(4)*1024*1024*1024*1024;
@@ -2170,23 +2186,27 @@ static MemoryRange choose_global_exclusion_range() {
     r_addr = min(r_addr, (uint64_t(1) << bits) - range_size);
     remote_ptr<void> addr = floor_page_size(remote_ptr<void>(r_addr));
     MemoryRange ret(addr, (uintptr_t)range_size);
-    if (!overlaps_asan_usage(ret)) {
+    if (!session || !overlaps_excluded_range(*session, ret)) {
       return ret;
     }
   }
 }
 
-MemoryRange AddressSpace::get_global_exclusion_range() {
-  static MemoryRange global_exclusion_range = choose_global_exclusion_range();
+MemoryRange AddressSpace::get_global_exclusion_range(const RecordSession* session) {
+  static MemoryRange global_exclusion_range = choose_global_exclusion_range(session);
   return global_exclusion_range;
 }
 
 remote_ptr<void> AddressSpace::chaos_mode_find_free_memory(RecordTask* t,
                                                            size_t len, remote_ptr<void> hint) {
-  MemoryRange global_exclusion_range = get_global_exclusion_range();
+  if (is_all_memory_excluded(t->session())) {
+    return nullptr;
+  }
+
+  MemoryRange global_exclusion_range = get_global_exclusion_range(&t->session());
   // NB: Above RR_PAGE_ADDR is probably not free anyways, but if it somehow is
   // don't hand it out again.
-  static MemoryRange rrpage_so_range = MemoryRange(RR_PAGE_ADDR - page_size(), RR_PAGE_ADDR + page_size());
+  static MemoryRange rrpage_so_range = MemoryRange(RR_PAGE_ADDR - PRELOAD_LIBRARY_PAGE_SIZE, RR_PAGE_ADDR + PRELOAD_LIBRARY_PAGE_SIZE);
 
   // Ignore the hint half the time.
   if (hint && (random() & 1)) {
@@ -2257,9 +2277,10 @@ remote_ptr<void> AddressSpace::chaos_mode_find_free_memory(RecordTask* t,
     if (r.intersects(global_exclusion_range)) {
       continue;
     }
-    if (t->session().asan_active() && sizeof(size_t) == 8) {
-      LOG(debug) << "Checking ASAN shadow";
-      if (overlaps_asan_usage(r)) {
+    if (!t->session().excluded_ranges().empty()) {
+      ASSERT(t, word_size(t->arch()) >= 8)
+        << "Chaos mode with ASAN/TSAN not supported in 32-bit processes";
+      if (overlaps_excluded_range(t->session(), r)) {
         continue;
       }
     }

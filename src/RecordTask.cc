@@ -199,7 +199,8 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       retry_syscall_patching(false),
       sent_shutdown_kill(false),
       did_execveat(false),
-      tick_request_override((TicksRequest)0) {
+      tick_request_override((TicksRequest)0),
+      schedule_frozen(false) {
   push_event(Event::sentinel());
   if (session.tasks().empty()) {
     // Initial tracee. It inherited its state from this process, so set it up.
@@ -372,7 +373,7 @@ void RecordTask::post_exec() {
 
 template <typename Arch> static void do_preload_init_arch(RecordTask* t) {
   auto params = t->read_mem(
-      remote_ptr<rrcall_init_preload_params<Arch>>(t->regs().arg1()));
+      remote_ptr<rrcall_init_preload_params<Arch>>(t->regs().orig_arg1()));
 
   t->syscallbuf_code_layout.syscallbuf_syscall_hook =
       params.syscallbuf_syscall_hook.rptr().as_int();
@@ -447,7 +448,7 @@ template <typename Arch> void RecordTask::init_buffers_arch() {
   AutoRemoteSyscalls remote(this);
 
   // Arguments to the rrcall.
-  remote_ptr<rrcall_init_buffers_params<Arch>> child_args = regs().arg1();
+  remote_ptr<rrcall_init_buffers_params<Arch>> child_args = regs().orig_arg1();
   auto args = read_mem(child_args);
 
   args.cloned_file_data_fd = -1;
@@ -470,26 +471,26 @@ template <typename Arch> void RecordTask::init_buffers_arch() {
         session().use_read_cloning()) {
       cloned_file_data_fname = trace_writer().file_data_clone_file_name(tuid());
       ScopedFd clone_file(cloned_file_data_fname.c_str(), O_RDWR | O_CREAT, 0600);
-      int cloned_file_data = remote.send_fd(clone_file.get());
-      ASSERT(this, cloned_file_data >= 0);
-      int free_fd = find_free_file_descriptor(tid);
-      cloned_file_data_fd_child =
-          remote.syscall(syscall_number_for_dup3(arch()), cloned_file_data,
-                          free_fd, O_CLOEXEC);
-      if (cloned_file_data_fd_child != free_fd) {
-        ASSERT(this, cloned_file_data_fd_child < 0);
-        LOG(warn) << "Couldn't dup clone-data file to free fd";
-        cloned_file_data_fd_child = cloned_file_data;
-      } else {
-        // Prevent the child from closing this fd. We're going to close it
-        // ourselves and we don't want the child closing it and then reopening
-        // its own file with this fd.
-        fds->add_monitor(this, cloned_file_data_fd_child,
-                          new PreserveFileMonitor());
-        remote.infallible_syscall(syscall_number_for_close(arch()),
-                                  cloned_file_data);
+      int cloned_file_data = remote.infallible_send_fd_if_alive(clone_file);
+      if (cloned_file_data >= 0) {
+        int free_fd = find_free_file_descriptor(tid);
+        cloned_file_data_fd_child =
+            remote.syscall(syscall_number_for_dup3(arch()), cloned_file_data,
+                            free_fd, O_CLOEXEC);
+        if (cloned_file_data_fd_child != free_fd) {
+          ASSERT(this, cloned_file_data_fd_child < 0);
+          LOG(warn) << "Couldn't dup clone-data file to free fd";
+          cloned_file_data_fd_child = cloned_file_data;
+        } else {
+          // Prevent the child from closing this fd. We're going to close it
+          // ourselves and we don't want the child closing it and then reopening
+          // its own file with this fd.
+          fds->add_monitor(this, cloned_file_data_fd_child,
+                            new PreserveFileMonitor());
+          remote.infallible_close_syscall_if_alive(cloned_file_data);
+        }
+        args.cloned_file_data_fd = cloned_file_data_fd_child;
       }
-      args.cloned_file_data_fd = cloned_file_data_fd_child;
     }
   } else {
     args.syscallbuf_ptr = remote_ptr<void>(nullptr);
@@ -610,17 +611,7 @@ void RecordTask::will_resume_execution(ResumeRequest, WaitRequest,
       // We're injecting a signal, so make sure that signal is unblocked.
       sigset &= ~signal_bit(sig);
     }
-    int ret = fallible_ptrace(PTRACE_SETSIGMASK, remote_ptr<void>(8), &sigset);
-    if (ret < 0) {
-      if (errno == EIO) {
-        FATAL() << "PTRACE_SETSIGMASK not supported; rr requires Linux kernel >= 3.11";
-      }
-      ASSERT(this, errno == EINVAL);
-    } else {
-      LOG(debug) << "Set signal mask to block all signals (bar "
-                 << "SYSCALLBUF_DESCHED_SIGNAL/TIME_SLICE_SIGNAL) while we "
-                 << " have a stashed signal";
-    }
+    set_sigmask(sigset);
   }
 
   // RESUME_NO_TICKS means that tracee code is not going to run so there's no
@@ -724,7 +715,7 @@ void RecordTask::set_emulated_ptracer(RecordTask* tracer) {
   }
 }
 
-bool RecordTask::emulate_ptrace_stop(WaitStatus status,
+bool RecordTask::emulate_ptrace_stop(WaitStatus status, EmulatedStopType stop_type,
                                      const siginfo_t* siginfo, int si_code) {
   ASSERT(this, emulated_stop_type == NOT_STOPPED);
   if (!emulated_ptracer) {
@@ -744,12 +735,12 @@ bool RecordTask::emulate_ptrace_stop(WaitStatus status,
     }
     save_ptrace_signal_siginfo(si);
   }
-  force_emulate_ptrace_stop(status);
+  force_emulate_ptrace_stop(status, stop_type);
   return true;
 }
 
-void RecordTask::force_emulate_ptrace_stop(WaitStatus status) {
-  emulated_stop_type = status.group_stop() ? GROUP_STOP : SIGNAL_DELIVERY_STOP;
+void RecordTask::force_emulate_ptrace_stop(WaitStatus status, EmulatedStopType stop_type) {
+  emulated_stop_type = stop_type;
   emulated_stop_code = status;
   emulated_stop_pending = true;
   emulated_ptrace_SIGCHLD_pending = true;
@@ -1250,6 +1241,11 @@ sig_set_t RecordTask::get_sigmask() {
 void RecordTask::unblock_signal(int sig) {
   sig_set_t mask = get_sigmask();
   mask &= ~signal_bit(sig);
+  set_sigmask(mask);
+  invalidate_sigmask();
+}
+
+void RecordTask::set_sigmask(sig_set_t mask) {
   int ret = fallible_ptrace(PTRACE_SETSIGMASK, remote_ptr<void>(8), &mask);
   if (ret < 0) {
     if (errno == EIO) {
@@ -1261,7 +1257,6 @@ void RecordTask::unblock_signal(int sig) {
                << "SYSCALLBUF_DESCHED_SIGNAL/TIME_SLICE_SIGNAL) while we "
                << " have a stashed signal";
   }
-  invalidate_sigmask();
 }
 
 void RecordTask::set_sig_handler_default(int sig) {
@@ -1354,7 +1349,7 @@ void RecordTask::stash_sig() {
   }
 
   const siginfo_t& si = get_siginfo();
-  stashed_signals.push_back(StashedSignal(si, is_deterministic_signal(this)));
+  stashed_signals.push_back(StashedSignal(si, is_deterministic_signal(this), ip()));
   // Once we've stashed a signal, stop at the next traced/untraced syscall to
   // check whether we need to process the signal before it runs.
   stashed_signals_blocking_more_signals =
@@ -1387,7 +1382,7 @@ void RecordTask::stash_synthetic_sig(const siginfo_t& si,
   }
 
   stashed_signals.insert(stashed_signals.begin(),
-                         StashedSignal(si, deterministic));
+                         StashedSignal(si, deterministic, ip()));
   stashed_signals_blocking_more_signals =
       break_at_syscallbuf_final_instruction =
           break_at_syscallbuf_traced_syscalls =
@@ -1403,10 +1398,10 @@ bool RecordTask::has_stashed_sig(int sig) const {
   return false;
 }
 
-const siginfo_t* RecordTask::stashed_sig_not_synthetic_SIGCHLD() const {
+const RecordTask::StashedSignal* RecordTask::stashed_sig_not_synthetic_SIGCHLD() const {
   for (auto it = stashed_signals.begin(); it != stashed_signals.end(); ++it) {
     if (!is_synthetic_SIGCHLD(it->siginfo)) {
-      return &it->siginfo;
+      return &*it;
     }
   }
   return nullptr;
@@ -1523,7 +1518,14 @@ bool RecordTask::is_in_syscallbuf() {
                           p < syscallbuf_code_layout.get_pc_thunks_end)) {
     // Look at the caller to see if we're in the syscallbuf or not.
     bool ok = true;
-    uint64_t addr = read_ptr(this, regs().sp(), &ok);
+    uint64_t addr;
+    if (arch() == aarch64) {
+      addr = regs().xlr();
+    }
+    else {
+      ASSERT(this, is_x86ish(arch())) << "Unknown architecture";
+      addr = read_ptr(this, regs().sp(), &ok);
+    }
     if (ok) {
       p = addr;
     }

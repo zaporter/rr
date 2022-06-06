@@ -36,6 +36,9 @@ enum EmulatedStopType {
   NOT_STOPPED,
   GROUP_STOP,          // stopped by a signal. This applies to non-ptracees too.
   SIGNAL_DELIVERY_STOP,// Stopped before delivering a signal. ptracees only.
+  SYSCALL_ENTRY_STOP,  // Stopped at syscall entry. ptracees only
+  SYSCALL_EXIT_STOP,   // Stopped at syscall exit. ptracees only
+  SECCOMP_STOP,        // Stopped at seccomp stop. ptracees only
   CHILD_STOP           // All other kinds of non-ptrace stops
 };
 
@@ -112,11 +115,17 @@ public:
    * Returns true if the task is stopped-for-emulated-ptrace, false otherwise.
    */
   bool emulate_ptrace_stop(WaitStatus status,
+                           const siginfo_t* siginfo = nullptr, int si_code = 0) {
+    return emulate_ptrace_stop(status, status.group_stop() ? GROUP_STOP : SIGNAL_DELIVERY_STOP,
+      siginfo, si_code);
+  }
+  bool emulate_ptrace_stop(WaitStatus status, EmulatedStopType stop_type,
                            const siginfo_t* siginfo = nullptr, int si_code = 0);
+
   /**
    * Force the ptrace-stop state no matter what state the task is currently in.
    */
-  void force_emulate_ptrace_stop(WaitStatus status);
+  void force_emulate_ptrace_stop(WaitStatus status, EmulatedStopType stop_type);
   /**
    * If necessary, signal the ptracer that this task has exited.
    */
@@ -278,14 +287,16 @@ public:
   void stash_synthetic_sig(const siginfo_t& si,
                            SignalDeterministic deterministic);
   bool has_stashed_sig() const { return !stashed_signals.empty(); }
-  const siginfo_t* stashed_sig_not_synthetic_SIGCHLD() const;
-  bool has_stashed_sig(int sig) const;
   struct StashedSignal {
-    StashedSignal(const siginfo_t& siginfo, SignalDeterministic deterministic)
-        : siginfo(siginfo), deterministic(deterministic) {}
+    StashedSignal(const siginfo_t& siginfo, SignalDeterministic deterministic,
+                  remote_code_ptr ip)
+        : siginfo(siginfo), deterministic(deterministic), ip(ip) {}
     siginfo_t siginfo;
     SignalDeterministic deterministic;
+    remote_code_ptr ip;
   };
+  const StashedSignal* stashed_sig_not_synthetic_SIGCHLD() const;
+  bool has_stashed_sig(int sig) const;
   const StashedSignal* peek_stashed_sig_to_deliver() const;
   void pop_stash_sig(const StashedSignal* stashed);
   void stashed_signal_processed();
@@ -599,6 +610,8 @@ public:
    */
   void send_synthetic_SIGCHLD_if_necessary();
 
+  void set_sigmask(sig_set_t mask);
+
 private:
   /* Retrieve the tid of this task from the tracee and store it */
   void update_own_namespace_tid();
@@ -796,6 +809,10 @@ public:
   // Set if the tracee requested an override of the ticks request.
   // Used for testing.
   TicksRequest tick_request_override;
+
+  // Set to prevent the scheduler from scheduling this tid, even
+  // if it is otherwise considered runnable. Used for testing.
+  bool schedule_frozen;
 };
 
 } // namespace rr

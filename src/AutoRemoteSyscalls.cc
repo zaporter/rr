@@ -87,7 +87,9 @@ AutoRemoteSyscalls::AutoRemoteSyscalls(Task* t,
       new_tid_(-1),
       scratch_mem_was_mapped(false),
       use_singlestep_path(false),
-      enable_mem_params_(enable_mem_params) {
+      enable_mem_params_(enable_mem_params),
+      restore_sigmask(false),
+      need_sigpending_renable(false) {
   if (initial_at_seccomp) {
     // This should only ever happen during recording - we don't use the
     // seccomp traps during replay.
@@ -109,6 +111,38 @@ AutoRemoteSyscalls::AutoRemoteSyscalls(Task* t,
              is_SIGTRAP_default_and_unblocked(t));
   if (enable_mem_params == ENABLE_MEMORY_PARAMS) {
     maybe_fix_stack_pointer();
+  }
+  if (t->status().is_syscall() && t->regs().syscall_may_restart()) {
+    // VERY rare corner case alert: It is possible for the following sequence
+    // of events to occur:
+    //
+    // 1. Thread A is in a blocking may-restart syscall and gets interrupted by a tg-targeted signal
+    // 2. Thread B dequeues the signal
+    // 3. Thread A is in the syscall-exit-stop with TIF_SIGPENDING set (with registers indicating syscall restart)
+    // 4. We get here to perform an AutoRemoteSyscall
+    // 5. During AutoRemoteSyscall, TIF_SIGPENDING gets cleared on return to userspace
+    // 6. We finish the AutoRemoteSyscall and re-apply the registers.
+    // 7. ... As a result, the kernel does not check whether it needs to perform the
+    ///   syscall-restart register adjustment because TIF_SIGPENDING is not set.
+    // 8. The -ERESTART error code leaks to userspace.
+    //
+    // Arguably this is a kernel bug, but it's not clear how the behavior should be changed.
+    //
+    // To work around this, we forcibly re-enable TIF_SIGPENDING when cleaning up
+    // AutoRemoteSyscall (see below).
+    need_sigpending_renable = true;
+  }
+  if (t->session().is_recording()) {
+    RecordTask *rt = static_cast<RecordTask*>(t);
+    if (rt->schedule_frozen) {
+      // If we're explicitly controlling the schedule, make sure not to accidentally run
+      // any signals that we were not meant to be able to see.
+      restore_sigmask = true;
+      sigmask_to_restore = rt->get_sigmask();
+      sig_set_t all_blocked;
+      memset(&all_blocked, 0xff, sizeof(all_blocked));
+      rt->set_sigmask(all_blocked);
+    }
   }
 }
 
@@ -186,10 +220,12 @@ void AutoRemoteSyscalls::maybe_fix_stack_pointer() {
   if (found_stack.start().is_null()) {
     AutoRemoteSyscalls remote(t, DISABLE_MEMORY_PARAMS);
     found_stack =
-        MemoryRange(remote.infallible_mmap_syscall(
+        MemoryRange(remote.infallible_mmap_syscall_if_alive(
                         remote_ptr<void>(), 4096, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0),
                     4096);
+    ASSERT(t, !found_stack.start().is_null())
+      << "Tracee unexpectedly died here";
     scratch_mem_was_mapped = true;
   }
 
@@ -215,13 +251,14 @@ void AutoRemoteSyscalls::restore_state_to(Task* t) {
   auto regs = initial_regs;
   regs.set_ip(initial_ip);
   regs.set_sp(initial_sp);
-  // Restore stomped registers.
-  t->set_regs(regs);
   // If we were sitting at a seccomp trap, try to get back there by resuming
   // here. Since the original register contents caused a seccomp trap,
   // re-running the syscall with the same registers should put us right back
   // to this same seccomp trap.
   if (initial_at_seccomp && t->ptrace_event() != PTRACE_EVENT_SECCOMP) {
+    regs.set_ip(initial_ip.decrement_by_syscall_insn_length(t->arch()));
+    regs.set_syscallno(regs.original_syscallno());
+    t->set_regs(regs);
     RecordTask* rt = static_cast<RecordTask*>(t);
     while (true) {
       rt->resume_execution(RESUME_CONT, RESUME_WAIT, RESUME_NO_TICKS);
@@ -230,8 +267,22 @@ void AutoRemoteSyscalls::restore_state_to(Task* t) {
       rt->stash_sig();
     }
     ASSERT(rt, rt->ptrace_event() == PTRACE_EVENT_SECCOMP);
+  } else {
+    // Restore stomped registers.
+    t->set_regs(regs);
   }
   t->set_status(restore_wait_status);
+  if (restore_sigmask) {
+    static_cast<RecordTask*>(t)->set_sigmask(sigmask_to_restore);
+  }
+  if (need_sigpending_renable) {
+    // The purpose of this PTRACE_INTERRUPT is to re-enable TIF_SIGPENDING on
+    // the tracee, without forcing any actual signals on it. Since PTRACE_INTERRUPT
+    // needs to be able to interrupt re-startable system calls, it is required
+    // to set TIF_SIGPENDING, but the fact that this works is of course a very
+    // deep implementation detail.
+    t->ptrace_if_alive(PTRACE_INTERRUPT, nullptr, nullptr);
+  }
 }
 
 static bool ignore_signal(Task* t) {
@@ -277,7 +328,8 @@ long AutoRemoteSyscalls::syscall_base(int syscallno, Registers& callregs) {
   callregs.set_syscallno(syscallno);
   t->set_regs(callregs);
 
-  if (use_singlestep_path) {
+  bool from_seccomp = initial_at_seccomp && t->ptrace_event() == PTRACE_EVENT_SECCOMP;
+  if (use_singlestep_path && !from_seccomp) {
     while (true) {
       t->resume_execution(RESUME_SINGLESTEP, RESUME_WAIT, RESUME_NO_TICKS);
       LOG(debug) << "Used singlestep path; status=" << t->status();
@@ -303,12 +355,12 @@ long AutoRemoteSyscalls::syscall_base(int syscallno, Registers& callregs) {
       ASSERT(t, false) << "Unexpected status " << t->status();
     }
   } else {
-    if (initial_at_seccomp && t->ptrace_event() == PTRACE_EVENT_SECCOMP) {
+    if (from_seccomp) {
       LOG(debug) << "Skipping enter_syscall - already at seccomp stop";
     } else {
       t->enter_syscall();
+      LOG(debug) << "Used enter_syscall; status=" << t->status();
     }
-    LOG(debug) << "Used enter_syscall; status=" << t->status();
     // proceed to syscall exit
     t->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_NO_TICKS);
     LOG(debug) << "syscall exit status=" << t->status();
@@ -549,6 +601,7 @@ template <typename Arch> int AutoRemoteSyscalls::send_fd_arch(const ScopedFd &ou
        buffer so it doesn't get read by another child later! */
     int fd = recvmsg_socket(task()->session().tracee_socket_receiver_fd());
     if (fd >= 0) {
+      ASSERT(t, fd != our_fd.get()) << "This should always return a fresh fd!";
       close(fd);
     }
     return -ESRCH;
@@ -562,32 +615,46 @@ int AutoRemoteSyscalls::send_fd(const ScopedFd &our_fd) {
   RR_ARCH_FUNCTION(send_fd_arch, arch(), our_fd);
 }
 
+void AutoRemoteSyscalls::infallible_close_syscall_if_alive(int child_fd) {
+  infallible_syscall_if_alive(syscall_number_for_close(arch()), child_fd);
+}
+
+int AutoRemoteSyscalls::infallible_send_fd_if_alive(const ScopedFd &our_fd) {
+  int child_fd = send_fd(our_fd);
+  ASSERT(t, child_fd >= 0 || (child_fd == -ESRCH && !t->session().is_replaying()))
+    << "Failed to send fd; err=" << errno_name(-child_fd);
+  return child_fd;
+}
+
 void AutoRemoteSyscalls::infallible_send_fd_dup(const ScopedFd& our_fd, int dup_to, int dup3_flags) {
-  int remote_fd = send_fd(our_fd);
-  ASSERT(task(), remote_fd >= 0);
+  int remote_fd = infallible_send_fd_if_alive(our_fd);
+  ASSERT(t, remote_fd >= 0);
   if (remote_fd != dup_to) {
     long ret = infallible_syscall(syscall_number_for_dup3(arch()), remote_fd,
                                   dup_to, dup3_flags);
     ASSERT(task(), ret == dup_to);
-    infallible_syscall(syscall_number_for_close(arch()), remote_fd);
+    infallible_close_syscall_if_alive(remote_fd);
   }
 }
 
-remote_ptr<void> AutoRemoteSyscalls::infallible_mmap_syscall(
+remote_ptr<void> AutoRemoteSyscalls::infallible_mmap_syscall_if_alive(
     remote_ptr<void> addr, size_t length, int prot, int flags, int child_fd,
-    uint64_t offset_pages) {
+    uint64_t offset_bytes) {
+  ASSERT(t, offset_bytes % page_size() == 0)
+    << "mmap offset (" << offset_bytes << ") must be multiple of page size ("
+    << page_size() << ")";
   // The first syscall argument is called "arg 1", so
   // our syscall-arg-index template parameter starts
   // with "1".
   remote_ptr<void> ret =
       has_mmap2_syscall(arch())
-          ? infallible_syscall_ptr(syscall_number_for_mmap2(arch()), addr,
-                                   length, prot, flags, child_fd,
-                                   (off_t)offset_pages)
-          : infallible_syscall_ptr(syscall_number_for_mmap(arch()), addr,
-                                   length, prot, flags, child_fd,
-                                   offset_pages * page_size());
-  if (flags & MAP_FIXED) {
+          ? infallible_syscall_ptr_if_alive(syscall_number_for_mmap2(arch()), addr,
+                                            length, prot, flags, child_fd,
+                                            (off_t)offset_bytes / 4096)
+          : infallible_syscall_ptr_if_alive(syscall_number_for_mmap(arch()), addr,
+                                            length, prot, flags, child_fd,
+                                            offset_bytes);
+  if (ret && (flags & MAP_FIXED)) {
     ASSERT(t, addr == ret) << "MAP_FIXED at " << addr << " but got " << ret;
   }
   return ret;
@@ -603,6 +670,7 @@ int64_t AutoRemoteSyscalls::infallible_lseek_syscall(int fd, int64_t offset,
       return t->read_mem(mem.get().cast<int64_t>());
     }
     case x86_64:
+    case aarch64:
       return infallible_syscall(syscall_number_for_lseek(arch()), fd, offset,
                                 whence);
     default:
@@ -616,7 +684,7 @@ void AutoRemoteSyscalls::check_syscall_result(long ret, int syscallno, bool allo
     // Sign-extend ret because it can be a 32-bit negative errno
     ret = (int)ret;
   }
-  if (allow_death && ret == -ESRCH) {
+  if (ret == -ESRCH && allow_death && !t->session().is_replaying()) {
     return;
   }
   if (-4096 < ret && ret < 0) {
@@ -636,13 +704,13 @@ void AutoRemoteSyscalls::finish_direct_mmap(
                                int prot, int flags,
                                const string& backing_file_name,
                                int backing_file_open_flags,
-                               off64_t backing_offset_pages,
+                               off64_t backing_offset_bytes,
                                struct stat& real_file, string& real_file_name) {
   int fd;
 
   LOG(debug) << "directly mmap'ing " << length << " bytes of "
-             << backing_file_name << " at page offset "
-             << HEX(backing_offset_pages);
+             << backing_file_name << " at offset "
+             << HEX(backing_offset_bytes);
 
   ASSERT(task(), !(flags & MAP_GROWSDOWN));
 
@@ -655,7 +723,7 @@ void AutoRemoteSyscalls::finish_direct_mmap(
                             backing_file_open_flags);
   }
   /* And mmap that file. */
-  infallible_mmap_syscall(rec_addr, length,
+  infallible_mmap_syscall_if_alive(rec_addr, length,
                           /* (We let SHARED|WRITEABLE
                           * mappings go through while
                           * they're not handled properly,
@@ -666,7 +734,7 @@ void AutoRemoteSyscalls::finish_direct_mmap(
                           * memory devices (requires
                           * MAP_SHARED_VALIDATE). Drop it for the
                           * backing file. */
-                          backing_offset_pages);
+                          backing_offset_bytes);
 
   // While it's open, grab the link reference.
   real_file = task()->stat_fd(fd);
@@ -674,7 +742,7 @@ void AutoRemoteSyscalls::finish_direct_mmap(
 
   /* Don't leak the tmp fd.  The mmap doesn't need the fd to
    * stay open. */
-  infallible_syscall(syscall_number_for_close(arch()), fd);
+  infallible_close_syscall_if_alive(fd);
 }
 
 

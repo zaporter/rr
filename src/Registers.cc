@@ -463,23 +463,24 @@ size_t Registers::read_register_by_user_offset(uint8_t* buf, uintptr_t offset,
 }
 
 template <typename Arch>
-void Registers::write_register_arch(GdbRegister regno, const void* value,
+bool Registers::write_register_arch(GdbRegister regno, const void* value,
                                     size_t value_size) {
   RegisterValue& rv = RegisterInfo<Arch>::registers[regno];
 
   if (rv.nbytes == 0) {
     // TODO: can we get away with not writing these?
     if (RegisterInfo<Arch>::ignore_undefined_register(regno)) {
-      return;
+      return true;
     }
-    LOG(warn) << "Unhandled register name " << regno;
+    return false;
   } else {
     DEBUG_ASSERT(value_size == rv.nbytes);
     memcpy(rv.pointer_into(&u), value, value_size);
+    return true;
   }
 }
 
-void Registers::write_register(GdbRegister regno, const void* value,
+bool Registers::write_register(GdbRegister regno, const void* value,
                                size_t value_size) {
   RR_ARCH_FUNCTION(write_register_arch, arch(), regno, value, value_size);
 }
@@ -720,10 +721,14 @@ bool Registers::syscall_may_restart() const {
 }
 
 ostream& operator<<(ostream& stream, const Registers& r) {
-  stream << "{ args:(" << HEX(r.arg1()) << "," << HEX(r.arg2()) << ","
+  stream << "{ ip:" << HEX(r.ip().register_value()) << " args:(" << HEX(r.arg1()) << "," << HEX(r.arg2()) << ","
          << HEX(r.arg3()) << "," << HEX(r.arg4()) << "," << HEX(r.arg5()) << ","
-         << r.arg6() << ") orig_syscall: " << r.original_syscallno() <<
-         " syscallno: " << r.syscallno() << " }";
+         << r.arg6() << ") orig_syscall: " << r.original_syscallno()
+         << " syscallno: " << r.syscallno();
+  if (r.arch() == aarch64) {
+    stream << " orig_arg1: " << HEX(r.orig_arg1());
+  }
+  stream << " }";
   return stream;
 }
 

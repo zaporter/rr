@@ -4,6 +4,7 @@
 #define RR_MEMORY_RANGE_H_
 
 #include "core.h"
+#include "log.h"
 #include "remote_ptr.h"
 
 namespace rr {
@@ -56,6 +57,10 @@ public:
   remote_ptr<void> start() const { return start_; }
   remote_ptr<void> end() const { return end_; }
   size_t size() const { return end_ - start_; }
+
+  static MemoryRange all() {
+    return MemoryRange(remote_ptr<void>(), remote_ptr<void>(UINTPTR_MAX));
+  }
 
   // XXX DO NOT USE
   void update_start(remote_ptr<void> s) const {

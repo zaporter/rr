@@ -138,7 +138,6 @@ static void check_xsave_compatibility(const TraceReader& trace_in) {
   // Check that sizes and offsets of supported XSAVE areas area all identical.
   // An Intel employee promised this on a mailing list...
   // https://lists.xen.org/archives/html/xen-devel/2013-09/msg00484.html
-  // His promise isn't binding on AMD though.
   for (int feature = 2; feature <= 63; ++feature) {
     if (!(tracee_xcr0 & our_xcr0 & (uint64_t(1) << feature))) {
       continue;
@@ -150,10 +149,8 @@ static void check_xsave_compatibility(const TraceReader& trace_in) {
         record->out.ebx != data.ebx ||
         (check_alignment && (record->out.ecx & 2) != (data.ecx & 2))) {
       CLEAN_FATAL()
-          << "XSAVE offset/size/alignment differs for feature " << feature << "\n"
-          << "Expected " << record->out.eax << " == " << data.eax << " && "
-          << record->out.ebx << " == " << data.ebx << " && (!" << check_alignment
-          << " || " << (record->out.ecx & 2) << " == " << (data.ecx & 2) << ")";
+          << "XSAVE offset/size/alignment differs for feature " << feature
+          << "; H. Peter Anvin said this would never happen!";
     }
   }
 }
@@ -290,7 +287,7 @@ DiversionSession::shr_ptr ReplaySession::clone_diversion() {
   LOG(debug) << "Deepforking ReplaySession " << this
              << " to DiversionSession...";
 
-  DiversionSession::shr_ptr session(new DiversionSession());
+  DiversionSession::shr_ptr session(new DiversionSession(cpu_binding()));
   session->ticks_semantics_ = ticks_semantics_;
   session->tracee_socket = tracee_socket;
   session->tracee_socket_fd_number = tracee_socket_fd_number;
@@ -319,7 +316,7 @@ Task* ReplaySession::new_task(pid_t tid, pid_t rec_tid, uint32_t serial,
   vector<string> argv;
   vector<string> env;
 
-  session->do_bind_cpu(session->trace_in);
+  session->do_bind_cpu();
   ScopedFd error_fd = session->create_spawn_task_error_pipe();
   ReplayTask* t = static_cast<ReplayTask*>(
       Task::spawn(*session, error_fd, &session->tracee_socket_fd(),
@@ -332,11 +329,11 @@ Task* ReplaySession::new_task(pid_t tid, pid_t rec_tid, uint32_t serial,
   return session;
 }
 
-int ReplaySession::cpu_binding(TraceStream& trace) const {
+int ReplaySession::cpu_binding() const {
   if (flags_.cpu_unbound) {
     return -1;
   }
-  return Session::cpu_binding(trace);
+  return Session::cpu_binding();
 }
 
 void ReplaySession::advance_to_next_trace_frame() {
@@ -401,7 +398,7 @@ static bool compute_ticks_request(
   *ticks_request = RESUME_UNLIMITED_TICKS;
   if (constraints.ticks_target > 0) {
     Ticks ticks_period =
-        constraints.ticks_target - PerfCounters::skid_size() - t->tick_count();
+        constraints.ticks_target - t->hpc.skid_size() - t->tick_count();
     if (ticks_period <= 0) {
       // Behave as if we actually executed something. Callers assume we did.
       t->clear_wait_status();
@@ -536,6 +533,7 @@ Completion ReplaySession::cont_syscall_boundary(
     return INCOMPLETE;
   }
 
+  t->apply_syscall_entry_regs();
   return COMPLETE;
 }
 
@@ -676,7 +674,9 @@ void ReplaySession::check_pending_sig(ReplayTask* t) {
 }
 
 static bool do_replay_assist(Task* t) {
-  auto type = AddressSpace::rr_page_syscall_from_exit_point(t->arch(), t->ip());
+  auto orig_ip = t->ip();
+  auto exit_ip = orig_ip.advance_past_executed_bkpt(t->arch());
+  auto type = AddressSpace::rr_page_syscall_from_exit_point(t->arch(), exit_ip);
   if (!type || type->enabled != AddressSpace::REPLAY_ASSIST) {
     return false;
   }
@@ -686,6 +686,11 @@ static bool do_replay_assist(Task* t) {
   Registers regs = t->regs();
   regs.set_syscall_result(next_rec.ret);
   t->on_syscall_exit(next_rec.syscallno, t->arch(), regs);
+  if (orig_ip != exit_ip) {
+    auto r = t->regs();
+    r.set_ip(exit_ip);
+    t->set_regs(r);
+  }
   return true;
 }
 
@@ -739,8 +744,9 @@ Completion ReplaySession::continue_or_step(ReplayTask* t,
       }
     } else if (t->stop_sig() == SIGTRAP) {
       // Detect replay assist but handle it later in flush_syscallbuf
-      auto type = AddressSpace::rr_page_syscall_from_exit_point(t->arch(), t->ip());
+      auto type = AddressSpace::rr_page_syscall_from_exit_point(t->arch(), t->ip().advance_past_executed_bkpt(t->arch()));
       if (type && type->enabled == AddressSpace::REPLAY_ASSIST) {
+        t->apply_syscall_entry_regs();
         return INCOMPLETE;
       }
     } else if (handle_unrecorded_cpuid_fault(t, constraints)) {
@@ -865,10 +871,11 @@ Completion ReplaySession::emulate_async_signal(
   LOG(debug) << "advancing " << ticks_left << " ticks to reach " << ticks << "/"
              << ip;
 
+  auto skid_size = t->hpc.skid_size();
   /* XXX should we only do this if (ticks > 10000)? */
-  while (ticks_left - PerfCounters::skid_size() > PerfCounters::skid_size()) {
+  while (ticks_left - skid_size > skid_size) {
     LOG(debug) << "  programming interrupt for "
-               << (ticks_left - PerfCounters::skid_size()) << " ticks";
+               << (ticks_left - skid_size) << " ticks";
 
     // Avoid overflow. If ticks_left > MAX_TICKS_REQUEST, execution will stop
     // early but we'll treat that just like a stray TIME_SLICE_SIGNAL and
@@ -879,7 +886,7 @@ Completion ReplaySession::emulate_async_signal(
     }
     continue_or_step(t, constraints,
                      (TicksRequest)(min<Ticks>(MAX_TICKS_REQUEST, ticks_left) -
-                                    PerfCounters::skid_size()));
+                                    skid_size));
     guard_unexpected_signal(t);
     if (in_syscallbuf_syscall_hook) {
       t->vm()->remove_breakpoint(in_syscallbuf_syscall_hook, BKPT_INTERNAL);
@@ -888,7 +895,7 @@ Completion ReplaySession::emulate_async_signal(
     ticks_left = ticks - t->tick_count();
 
     if (SIGTRAP == t->stop_sig()) {
-      if (in_syscallbuf_syscall_hook.increment_by_bkpt_insn_length(t->arch()) == t->ip()) {
+      if (t->ip().undo_executed_bkpt(t->arch()) == in_syscallbuf_syscall_hook) {
         t->move_ip_before_breakpoint();
         // Advance no further.
         return COMPLETE;
@@ -1467,8 +1474,8 @@ Completion ReplaySession::patch_next_syscall(
     }
     AutoRemoteSyscalls remote(t);
     ASSERT(t, km.flags() & MAP_ANONYMOUS);
-    remote.infallible_mmap_syscall(km.start(), km.size(), km.prot(),
-                                   km.flags() | MAP_FIXED, -1, 0);
+    remote.infallible_mmap_syscall_if_alive(km.start(), km.size(), km.prot(),
+                                            km.flags() | MAP_FIXED, -1, 0);
     t->vm()->map(t, km.start(), km.size(), km.prot(), km.flags(), 0, string(),
                  KernelMapping::NO_DEVICE, KernelMapping::NO_INODE, nullptr,
                  &km);
@@ -1503,7 +1510,7 @@ void ReplaySession::check_approaching_ticks_target(
     BreakStatus& break_status) {
   if (constraints.ticks_target > 0) {
     Ticks ticks_left = constraints.ticks_target - t->tick_count();
-    if (ticks_left <= PerfCounters::skid_size()) {
+    if (ticks_left <= t->hpc.skid_size()) {
       break_status.approaching_ticks_target = true;
     }
   }

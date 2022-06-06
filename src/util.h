@@ -447,6 +447,12 @@ void good_random(void* out, size_t out_len);
 
 std::vector<std::string> current_env();
 
+/**
+ * Returns the number of CPUs online. This is useful for sizing a thread
+ * pool.
+ * We might see CPUs with an index >= this value, so this is not useful
+ * for comparing with CPU indices.
+ */
 int get_num_cpus();
 
 enum class TrappedInstruction {
@@ -559,6 +565,9 @@ int pop_count(uint64_t v);
 void SAFE_FATAL(int err, const char *msg);
 
 bool coredumping_signal_takes_down_entire_vm();
+
+/* Parse tid from the proc file system path /proc/<pid>/<property> or /proc/<pid>/task/<tid>/<property> */
+int parse_tid_from_proc_path(const std::string& pathname, const std::string& property);
 
 } // namespace rr
 

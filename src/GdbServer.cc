@@ -19,9 +19,11 @@
 
 #include "BreakpointCondition.h"
 #include "ElfReader.h"
+#include "Event.h"
 #include "GdbCommandHandler.h"
 #include "GdbExpression.h"
 #include "ReplaySession.h"
+#include "ReplayTask.h"
 #include "ScopedFd.h"
 #include "StringVectorToCharArray.h"
 #include "Task.h"
@@ -43,6 +45,7 @@ GdbServer::GdbServer(std::unique_ptr<GdbConnection>& dbg, Task* t)
       final_event(UINT32_MAX),
       stop_replaying_to_target(false),
       interrupt_pending(false),
+      exit_sigkill_pending(false),
       emergency_debug_session(&t->session()),
       file_scope_pid(0) {
   memset(&stop_siginfo, 0, sizeof(stop_siginfo));
@@ -69,6 +72,9 @@ static const string& gdb_rr_macros() {
        << "end\n"
        << "document seek-ticks\n"
        << "restart at given ticks value\n"
+       << "end\n"
+       << "define jump\n"
+       << "  rr-denied jump\n"
        << "end\n"
        // In gdb version "Fedora 7.8.1-30.fc21", a raw "run" command
        // issued before any user-generated resume-execution command
@@ -166,6 +172,27 @@ static size_t get_reg(const Registers& regs, const ExtraRegisters& extra_regs,
   return num_bytes;
 }
 
+static bool set_reg(Task* target, const GdbRegisterValue& reg) {
+  if (!reg.defined) {
+    return false;
+  }
+
+  Registers regs = target->regs();
+  if (regs.write_register(reg.name, reg.value, reg.size)) {
+    target->set_regs(regs);
+    return true;
+  }
+
+  ExtraRegisters extra_regs = target->extra_regs();
+  if (extra_regs.write_register(reg.name, reg.value, reg.size)) {
+    target->set_extra_regs(extra_regs);
+    return true;
+  }
+
+  LOG(warn) << "Unhandled register name " << reg.name;
+  return false;
+}
+
 /**
  * Return the register |which|, which may not have a defined value.
  */
@@ -253,7 +280,7 @@ void GdbServer::dispatch_regs_request(const Registers& regs,
       end = have_PKU ? DREG_PKRU : (have_AVX ? DREG_YMM7H : DREG_ORIG_EAX);
       break;
     case x86_64:
-      end = have_PKU ? DREG_64_PKRU : (have_AVX ? DREG_64_YMM15H : DREG_ORIG_RAX);
+      end = have_PKU ? DREG_64_PKRU : (have_AVX ? DREG_64_YMM15H : DREG_GS_BASE);
       break;
     case aarch64:
       end = DREG_FPCR;
@@ -503,6 +530,7 @@ void GdbServer::dispatch_debugger_request(Session& session,
       }
       LOG(warn) << "Unable to find file descriptor for close";
       dbg->reply_close(EBADF);
+      return;
     }
     default:
       /* fall through to next switch stmt */
@@ -632,10 +660,8 @@ void GdbServer::dispatch_debugger_request(Session& session,
         dbg->reply_set_reg(false);
         return;
       }
-      if (req.reg().defined) {
-        Registers regs = target->regs();
-        regs.write_register(req.reg().name, req.reg().value, req.reg().size);
-        target->set_regs(regs);
+      if (!set_reg(target, req.reg())) {
+        LOG(warn) << "Attempt to set register " << req.reg().name << " failed";
       }
       dbg->reply_set_reg(true /*currently infallible*/);
       return;
@@ -721,6 +747,7 @@ void GdbServer::dispatch_debugger_request(Session& session,
       dbg->reply_rr_cmd(
           GdbCommandHandler::process_command(*this, target, req.text()));
       return;
+#ifdef PROC_SERVICE_H
     case DREQ_QSYMBOL: {
       // When gdb sends "qSymbol::", it means that gdb is ready to
       // respond to symbol requests.  This can be sent multiple times
@@ -774,6 +801,7 @@ void GdbServer::dispatch_debugger_request(Session& session,
       dbg->reply_tls_addr(ok, address);
       return;
     }
+#endif
     default:
       FATAL() << "Unknown debugger request " << req.type;
   }
@@ -1311,6 +1339,18 @@ GdbServer::ContinueOrStop GdbServer::debug_one_step(
     }
   }
 
+  if (exit_sigkill_pending) {
+    Task* t = timeline.current_session().current_task();
+    if (t->thread_group()->tguid() == debuggee_tguid) {
+      exit_sigkill_pending = false;
+      if (req.cont().run_direction == RUN_FORWARD) {
+        dbg->notify_stop(get_threadid(t), SIGKILL);
+        memset(&stop_siginfo, 0, sizeof(stop_siginfo));
+        return CONTINUE_DEBUGGING;
+      }
+    }
+  }
+
   if (req.cont().run_direction == RUN_FORWARD) {
     if (is_in_exec(timeline) &&
         timeline.current_session().current_task()->thread_group()->tguid() ==
@@ -1323,7 +1363,7 @@ GdbServer::ContinueOrStop GdbServer::debug_one_step(
       RunCommand command = compute_run_command_from_actions(
           timeline.current_session().current_task(), req, &signal_to_deliver);
       // Ignore gdb's |signal_to_deliver|; we just have to follow the replay.
-      result = timeline.replay_step_forward(command, target.event);
+      result = timeline.replay_step_forward(command);
     }
     if (result.status == REPLAY_EXITED) {
       return handle_exited_state(last_resume_request);
@@ -1334,10 +1374,18 @@ GdbServer::ContinueOrStop GdbServer::debug_one_step(
     // if tids get reused.
     RunCommand command = compute_run_command_for_reverse_exec(
         timeline.current_session(), debuggee_tguid, req, allowed_tasks);
-    auto stop_filter = [&](Task* t) -> bool {
+    auto stop_filter = [&](ReplayTask* t) -> bool {
       if (t->thread_group()->tguid() != debuggee_tguid) {
         return false;
       }
+
+      // don't stop for a signal that has been specified by QPassSignal
+      Event const& stop_event = t->current_trace_frame().event();
+      if (stop_event.is_signal_event() && dbg->is_pass_signal(stop_event.Signal().siginfo.si_signo)) {
+        LOG(debug) << "Filtering out event for signal " << stop_event.Signal().siginfo;
+        return false;
+      }
+
       // If gdb's requested actions don't allow the task to run, we still
       // let it run (we can't do anything else, since we're replaying), but
       // we won't report stops in that task.
@@ -1380,7 +1428,16 @@ GdbServer::ContinueOrStop GdbServer::debug_one_step(
   return CONTINUE_DEBUGGING;
 }
 
-bool GdbServer::at_target() {
+static bool target_event_reached(const ReplayTimeline& timeline, const GdbServer::Target& target, const ReplayResult& result) {
+  if (target.event == -1) {
+    return is_last_thread_exit(result.break_status) &&
+      (target.pid <= 0 || result.break_status.task_context.thread_group->tgid == target.pid);
+  } else {
+    return timeline.current_session().current_trace_frame().time() > target.event;
+  }
+}
+
+bool GdbServer::at_target(ReplayResult& result) {
   // Don't launch the debugger for the initial rr fork child.
   // No one ever wants that to happen.
   if (!timeline.current_session().done_initial_exec()) {
@@ -1390,7 +1447,8 @@ bool GdbServer::at_target() {
   if (!t) {
     return false;
   }
-  if (!timeline.can_add_checkpoint()) {
+  bool target_is_exit = target.event == -1;
+  if (!(timeline.can_add_checkpoint() || target_is_exit)) {
     return false;
   }
   if (stop_replaying_to_target) {
@@ -1409,14 +1467,13 @@ bool GdbServer::at_target() {
   // group happens to be scheduled here.  We don't take
   // "attach to process" to mean "attach to thread-group
   // leader".
-  return timeline.current_session().current_trace_frame().time() >
-             target.event &&
+  return target_event_reached(timeline, target, result) &&
          (!target.pid || t->tgid() == target.pid) &&
          (!target.require_exec || t->execed()) &&
          // Ensure we're at the start of processing an event. We don't
          // want to attach while we're finishing an exec() since that's a
          // slightly confusing state for ReplayTimeline's reverse execution.
-         !timeline.current_session().current_step_key().in_execution();
+         (!timeline.current_session().current_step_key().in_execution() || target_is_exit);
 }
 
 /**
@@ -1427,19 +1484,27 @@ void GdbServer::activate_debugger() {
   TraceFrame next_frame = timeline.current_session().current_trace_frame();
   FrameTime event_now = next_frame.time();
   Task* t = timeline.current_session().current_task();
-  if (target.event > 0 || target.pid) {
+  if (target.event || target.pid) {
     if (stop_replaying_to_target) {
       fprintf(stderr, "\a\n"
                       "--------------------------------------------------\n"
                       " ---> Interrupted; attached to NON-TARGET process %d at event %llu.\n"
                       "--------------------------------------------------\n",
               t->tgid(), (long long)event_now);
-    } else {
+    } else if (target.event >= 0) {
       fprintf(stderr, "\a\n"
                       "--------------------------------------------------\n"
                       " ---> Reached target process %d at event %llu.\n"
                       "--------------------------------------------------\n",
               t->tgid(), (long long)event_now);
+    } else {
+      ASSERT(t, target.event == -1);
+      fprintf(stderr, "\a\n"
+                      "--------------------------------------------------\n"
+                      " ---> Reached exit of target process %d at event %llu.\n"
+                      "--------------------------------------------------\n",
+              t->tgid(), (long long)event_now);
+      exit_sigkill_pending = true;
     }
   }
 
@@ -1534,12 +1599,12 @@ void GdbServer::restart_session(const GdbRequest& req) {
         return;
       }
       TraceFrame frame = tmp_reader.read_frame();
-      if (frame.tid() == task->tuid().tid() && frame.ticks() > target) {
+      if (frame.tid() == task->tuid().tid() && frame.ticks() >= target) {
         break;
       }
       last_time = frame.time();
     }
-    timeline.seek_to_ticks(last_time, target);
+    timeline.seek_to_ticks(last_time + 1, target);
   }
 
   interrupt_pending = true;
@@ -1566,9 +1631,9 @@ void GdbServer::restart_session(const GdbRequest& req) {
     target.event = req.restart().param;
     target.event = min(final_event - 1, target.event);
     timeline.seek_to_before_event(target.event);
+    ReplayResult result;
     do {
-      ReplayResult result =
-          timeline.replay_step_forward(RUN_CONTINUE, target.event);
+      result = timeline.replay_step_forward(RUN_CONTINUE);
       // We should never reach the end of the trace without hitting the stop
       // condition below.
       DEBUG_ASSERT(result.status != REPLAY_EXITED);
@@ -1578,7 +1643,7 @@ void GdbServer::restart_session(const GdbRequest& req) {
         in_debuggee_end_state = true;
         break;
       }
-    } while (!at_target());
+    } while (!at_target(result));
   }
   activate_debugger();
 }
@@ -1706,14 +1771,14 @@ static void print_debugger_launch_command(Task* t, const string& host,
 }
 
 void GdbServer::serve_replay(const ConnectionFlags& flags) {
+  ReplayResult result;
   do {
-    ReplayResult result =
-        timeline.replay_step_forward(RUN_CONTINUE, target.event);
+    result = timeline.replay_step_forward(RUN_CONTINUE);
     if (result.status == REPLAY_EXITED) {
       LOG(info) << "Debugger was not launched before end of trace";
       return;
     }
-  } while (!at_target());
+  } while (!at_target(result));
 
   unsigned short port = flags.dbg_port > 0 ? flags.dbg_port : getpid();
   // Don't probe if the user specified a port.  Explicitly
@@ -1874,6 +1939,8 @@ void GdbServer::emergency_debug(Task* t) {
   unsigned short port = t->tid;
   ScopedFd listen_fd = open_socket(localhost_addr.c_str(), &port, PROBE_PORT);
 
+  dump_rr_stack();
+
   char* test_monitor_pid = getenv("RUNNING_UNDER_TEST_MONITOR");
   if (test_monitor_pid) {
     pid_t pid = atoi(test_monitor_pid);
@@ -1886,7 +1953,6 @@ void GdbServer::emergency_debug(Task* t) {
     }
     kill(pid, SIGURG);
   } else {
-    dump_rr_stack();
     fputs("Launch gdb with\n  ", stderr);
     print_debugger_launch_command(t, localhost_addr, port, "gdb", stderr);
   }
@@ -1923,7 +1989,7 @@ static ScopedFd generate_fake_proc_maps(Task* t) {
         auto m2 = *it2;
         if (m2.flags & AddressSpace::Mapping::IS_RR_PAGE) {
           // Extend this mapping
-          map_end += t->vm()->rr_page_size();
+          map_end += PRELOAD_LIBRARY_PAGE_SIZE;
           // Skip the rr page
           ++it;
         }
@@ -1975,7 +2041,11 @@ static bool is_ld_mapping(string map_name) {
 }
 
 static bool is_likely_interp(string fsname) {
+#ifdef __aarch64__
+  return fsname == "/lib/ld-linux-aarch64.so.1";
+#else
   return fsname == "/lib64/ld-linux-x86-64.so.2" || fsname == "/lib/ld-linux.so.2";
+#endif
 }
 
 static remote_ptr<void> base_addr_from_rendezvous(Task* t, string fname)

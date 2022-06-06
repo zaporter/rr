@@ -27,15 +27,17 @@ namespace rr {
 #include "AssemblyTemplates.generated"
 
 static void write_and_record_bytes(RecordTask* t, remote_ptr<void> child_addr,
-                                   size_t size, const void* buf) {
-  t->write_bytes_helper(child_addr, size, buf);
-  t->record_local(child_addr, size, buf);
+                                   size_t size, const void* buf, bool* ok = nullptr) {
+  t->write_bytes_helper(child_addr, size, buf, ok);
+  if (!ok || *ok) {
+    t->record_local(child_addr, size, buf);
+  }
 }
 
 template <size_t N>
 static void write_and_record_bytes(RecordTask* t, remote_ptr<void> child_addr,
-                                   const uint8_t (&buf)[N]) {
-  write_and_record_bytes(t, child_addr, N, buf);
+                                   const uint8_t (&buf)[N], bool* ok = nullptr) {
+  write_and_record_bytes(t, child_addr, N, buf, ok);
 }
 
 template <typename T>
@@ -217,7 +219,11 @@ static remote_ptr<uint8_t> allocate_extended_jump(
       AutoRemoteSyscalls remote(t);
       int prot = PROT_READ | PROT_EXEC;
       int flags = MAP_ANONYMOUS | MAP_FIXED | MAP_PRIVATE;
-      remote.infallible_mmap_syscall(addr, page_size(), prot, flags, -1, 0);
+      auto ret = remote.infallible_mmap_syscall_if_alive(addr, page_size(), prot, flags, -1, 0);
+      if (!ret) {
+        /* Tracee died */
+        return nullptr;
+      }
       KernelMapping recorded(addr, addr + page_size(), string(),
                              KernelMapping::NO_DEVICE, KernelMapping::NO_INODE,
                              prot, flags);
@@ -275,11 +281,11 @@ template <typename JumpPatch, typename ExtendedJumpPatch>
 static bool patch_syscall_with_hook_x86ish(Monkeypatcher& patcher,
                                            RecordTask* t,
                                            const syscall_patch_hook& hook) {
-  uint8_t jump_patch[JumpPatch::size];
+  uint8_t jump_patch[syscall_instruction_length(x86_64) + hook.patch_region_length];
   // We're patching in a relative jump, so we need to compute the offset from
   // the end of the jump to our actual destination.
   auto jump_patch_start = t->regs().ip().to_data_ptr<uint8_t>();
-  auto jump_patch_end = jump_patch_start + sizeof(jump_patch);
+  auto jump_patch_end = jump_patch_start + JumpPatch::size;
   auto return_addr = t->regs().ip().to_data_ptr<uint8_t>().as_int() +
                      syscall_instruction_length(x86_64) +
                      hook.patch_region_length;
@@ -311,21 +317,18 @@ static bool patch_syscall_with_hook_x86ish(Monkeypatcher& patcher,
   ASSERT(t, jump_offset32 == jump_offset)
       << "allocate_extended_jump didn't work";
 
-  JumpPatch::substitute(jump_patch, jump_offset32);
-  write_and_record_bytes(t, jump_patch_start, jump_patch);
-
   // pad with NOPs to the next instruction
   static const uint8_t NOP = 0x90;
   DEBUG_ASSERT(syscall_instruction_length(x86_64) ==
                syscall_instruction_length(x86));
-  size_t nops_bufsize = syscall_instruction_length(x86_64) +
-                        hook.patch_region_length - sizeof(jump_patch);
-  std::unique_ptr<uint8_t[]> nops(new uint8_t[nops_bufsize]);
-  memset(nops.get(), NOP, nops_bufsize);
-  write_and_record_mem(t, jump_patch_start + sizeof(jump_patch), nops.get(),
-                       nops_bufsize);
-
-  return true;
+  memset(jump_patch, NOP, sizeof(jump_patch));
+  JumpPatch::substitute(jump_patch, jump_offset32);
+  bool ok = true;
+  write_and_record_bytes(t, jump_patch_start, sizeof(jump_patch), jump_patch, &ok);
+  if (!ok) {
+    LOG(warn) << "Couldn't write patch; errno=" << errno;
+  }
+  return ok;
 }
 
 template <>
@@ -470,7 +473,7 @@ void unpatch_syscalls_arch<X64Arch>(Monkeypatcher &patcher, Task *t) {
 template <>
 void unpatch_syscalls_arch<ARM64Arch>(Monkeypatcher &patcher, Task *t) {
   (void)patcher; (void)t;
-  FATAL() << "Unimplemented";
+  // FATAL() << "Unimplemented";
 }
 
 void Monkeypatcher::unpatch_syscalls_in(Task *t) {
@@ -579,6 +582,12 @@ bool Monkeypatcher::try_patch_syscall(RecordTask* t, bool entering_syscall) {
 
   Registers r = t->regs();
   remote_code_ptr ip = r.ip();
+  // We should not get here for untraced syscalls or anything else from the rr page.
+  // These should be normally prevented by our seccomp filter
+  // and in the case of syscalls interrupted by signals,
+  // the check for the syscall restart should prevent us from reaching here.
+  DEBUG_ASSERT(ip.to_data_ptr<void>() < AddressSpace::rr_page_start() ||
+               ip.to_data_ptr<void>() >= AddressSpace::rr_page_end());
   if (tried_to_patch_syscall_addresses.count(ip)) {
     return false;
   }
@@ -711,6 +720,10 @@ bool Monkeypatcher::try_patch_syscall(RecordTask* t, bool entering_syscall) {
                             sizeof(syscall_patch_hook::patch_region_bytes)));
 
       success = patch_syscall_with_hook(*this, t, hook);
+      if (!success && entering_syscall) {
+        // Need to reenter the syscall to undo exit_syscall_and_prepare_restart
+        t->enter_syscall();
+      }
       break;
     }
   }
@@ -749,10 +762,10 @@ void patch_after_exec_arch<X86Arch>(RecordTask* t, Monkeypatcher& patcher) {
   if (!t->vm()->has_vdso()) {
     patch_auxv_vdso(t, AT_SYSINFO_EHDR, AT_IGNORE);
   } else {
-    size_t librrpage_base = RR_PAGE_ADDR - AddressSpace::RRPAGE_RECORD_PAGE_OFFSET*RR_PAGE_SIZE;
+    size_t librrpage_base = RR_PAGE_ADDR - AddressSpace::RRPAGE_RECORD_PAGE_OFFSET*PRELOAD_LIBRARY_PAGE_SIZE;
     patch_auxv_vdso(t, AT_SYSINFO_EHDR, librrpage_base);
     patch_auxv_vdso(t, X86Arch::RR_AT_SYSINFO, librrpage_base +
-      AddressSpace::RRVDSO_PAGE_OFFSET*RR_PAGE_SIZE);
+      AddressSpace::RRVDSO_PAGE_OFFSET*PRELOAD_LIBRARY_PAGE_SIZE);
   }
 }
 
@@ -781,14 +794,14 @@ void patch_after_exec_arch<X64Arch>(RecordTask* t, Monkeypatcher& patcher) {
   for (const auto& m : t->vm()->maps()) {
     auto& km = m.map;
     patcher.patch_after_mmap(t, km.start(), km.size(),
-                             km.file_offset_bytes()/page_size(), -1,
+                             km.file_offset_bytes(), -1,
                              Monkeypatcher::MMAP_EXEC);
   }
 
   if (!t->vm()->has_vdso()) {
     patch_auxv_vdso(t, AT_SYSINFO_EHDR, AT_IGNORE);
   } else {
-    size_t librrpage_base = RR_PAGE_ADDR - AddressSpace::RRPAGE_RECORD_PAGE_OFFSET*RR_PAGE_SIZE;
+    size_t librrpage_base = RR_PAGE_ADDR - AddressSpace::RRPAGE_RECORD_PAGE_OFFSET*PRELOAD_LIBRARY_PAGE_SIZE;
     patch_auxv_vdso(t, AT_SYSINFO_EHDR, librrpage_base);
   }
 }
@@ -801,14 +814,14 @@ void patch_after_exec_arch<ARM64Arch>(RecordTask* t, Monkeypatcher& patcher) {
   for (const auto& m : t->vm()->maps()) {
     auto& km = m.map;
     patcher.patch_after_mmap(t, km.start(), km.size(),
-                             km.file_offset_bytes()/page_size(), -1,
+                             km.file_offset_bytes(), -1,
                              Monkeypatcher::MMAP_EXEC);
   }
 
   if (!t->vm()->has_vdso()) {
     patch_auxv_vdso(t, AT_SYSINFO_EHDR, AT_IGNORE);
   } else {
-    size_t librrpage_base = RR_PAGE_ADDR - AddressSpace::RRPAGE_RECORD_PAGE_OFFSET*RR_PAGE_SIZE;
+    size_t librrpage_base = RR_PAGE_ADDR - AddressSpace::RRPAGE_RECORD_PAGE_OFFSET*PRELOAD_LIBRARY_PAGE_SIZE;
     patch_auxv_vdso(t, AT_SYSINFO_EHDR, librrpage_base);
   }
 }
@@ -828,13 +841,15 @@ void patch_at_preload_init_arch<X64Arch>(RecordTask* t,
 
 template <>
 void patch_at_preload_init_arch<ARM64Arch>(RecordTask* t,
-                                           Monkeypatcher&) {
+                                           Monkeypatcher& patcher) {
   auto params = t->read_mem(
-      remote_ptr<rrcall_init_preload_params<ARM64Arch>>(t->regs().arg1()));
+      remote_ptr<rrcall_init_preload_params<ARM64Arch>>(t->regs().orig_arg1()));
   if (!params.syscallbuf_enabled) {
     return;
   }
-  FATAL() << "Unimplemented";
+
+  patcher.init_dynamic_syscall_patching(t, params.syscall_patch_hook_count,
+                                        params.syscall_patch_hooks);
 }
 
 void Monkeypatcher::patch_after_exec(RecordTask* t) {
@@ -854,12 +869,11 @@ void Monkeypatcher::patch_at_preload_init(RecordTask* t) {
 static remote_ptr<void> resolve_address(ElfReader& reader, uintptr_t elf_addr,
                                         remote_ptr<void> map_start,
                                         size_t map_size,
-                                        size_t map_offset_pages) {
+                                        uintptr_t map_offset) {
   uintptr_t file_offset;
   if (!reader.addr_to_offset(elf_addr, file_offset)) {
     LOG(warn) << "ELF address " << HEX(elf_addr) << " not in file";
   }
-  uintptr_t map_offset = uintptr_t(map_offset_pages) * page_size();
   if (file_offset < map_offset || file_offset + 32 > map_offset + map_size) {
     // The value(s) to be set are outside the mapped range. This happens
     // because code and data can be mapped in separate, partial mmaps in which
@@ -872,9 +886,9 @@ static remote_ptr<void> resolve_address(ElfReader& reader, uintptr_t elf_addr,
 static void set_and_record_bytes(RecordTask* t, ElfReader& reader,
                                  uintptr_t elf_addr, const void* bytes,
                                  size_t size, remote_ptr<void> map_start,
-                                 size_t map_size, size_t map_offset_pages) {
+                                 size_t map_size, size_t map_offset) {
   remote_ptr<void> addr =
-    resolve_address(reader, elf_addr, map_start, map_size, map_offset_pages);
+    resolve_address(reader, elf_addr, map_start, map_size, map_offset);
   if (!addr) {
     return;
   }
@@ -897,12 +911,12 @@ static void patch_dl_runtime_resolve(Monkeypatcher& patcher,
                                      uintptr_t elf_addr,
                                      remote_ptr<void> map_start,
                                      size_t map_size,
-                                     size_t map_offset_pages) {
+                                     size_t map_offset) {
   if (t->arch() != x86_64) {
     return;
   }
   remote_ptr<void> addr =
-    resolve_address(reader, elf_addr, map_start, map_size, map_offset_pages);
+    resolve_address(reader, elf_addr, map_start, map_size, map_offset);
   if (!addr) {
     return;
   }
@@ -967,7 +981,7 @@ static bool file_may_need_instrumentation(const AddressSpace::Mapping& map) {
 }
 
 void Monkeypatcher::patch_after_mmap(RecordTask* t, remote_ptr<void> start,
-                                     size_t size, size_t offset_pages,
+                                     size_t size, size_t offset_bytes,
                                      int child_fd, MmapMode mode) {
   const auto& map = t->vm()->mapping_of(start);
   if (file_may_need_instrumentation(map) &&
@@ -1013,7 +1027,7 @@ void Monkeypatcher::patch_after_mmap(RecordTask* t, remote_ptr<void> start,
         // pthread rwlocks don't try to use elision at all. See ELIDE_LOCK
         // in glibc's elide.h.
         set_and_record_bytes(t, reader, syms.addr(i) + 8, &zero, sizeof(zero),
-                             start, size, offset_pages);
+                             start, size, offset_bytes);
       }
       if (syms.is_name(i, "elision_init")) {
         // Make elision_init return without doing anything. This means
@@ -1022,7 +1036,7 @@ void Monkeypatcher::patch_after_mmap(RecordTask* t, remote_ptr<void> start,
         // elision-conf.c.
         static const uint8_t ret = 0xC3;
         set_and_record_bytes(t, reader, syms.addr(i), &ret, sizeof(ret), start,
-                             size, offset_pages);
+                             size, offset_bytes);
       }
       // The following operations can only be applied once because after the
       // patch is applied the code no longer matches the expected template.
@@ -1034,7 +1048,7 @@ void Monkeypatcher::patch_after_mmap(RecordTask* t, remote_ptr<void> start,
            syms.is_name(i, "_dl_runtime_resolve_xsave") ||
            syms.is_name(i, "_dl_runtime_resolve_xsavec"))) {
         patch_dl_runtime_resolve(*this, t, reader, syms.addr(i), start, size,
-                                 offset_pages);
+                                 offset_bytes);
       }
     }
   }

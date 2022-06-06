@@ -5,7 +5,9 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <elf.h>
+#ifdef EXECINFO_H
 #include <execinfo.h>
+#endif
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -29,6 +31,7 @@
 #include <string>
 #include <numeric>
 #include <random>
+#include <sstream>
 
 #include "preload/preload_interface.h"
 
@@ -750,6 +753,13 @@ bool should_copy_mmap_region(const KernelMapping& mapping,
     LOG(debug) << "  copying " << mapping.fsname();
     return true;
   }
+  if (mapping.fsname().rfind("/etc/passwd", 0) == 0 ||
+      mapping.fsname().rfind("/etc/group", 0) == 0) {
+    // These files (and suffixes such as .cache etc) change very frequently in
+    // some environments.
+    LOG(debug) << "  copying " << mapping.fsname();
+    return true;
+  }
   if (private_mapping && (prot & PROT_EXEC)) {
     /* Be optimistic about private executable mappings */
     LOG(debug) << "  (no copy for +x private mapping " << mapping.fsname() << ")";
@@ -1189,7 +1199,7 @@ static CloneParameters extract_clone_parameters_arch(const Registers& regs) {
       result.ctid = regs.arg4();
       break;
   }
-  int flags = (int)regs.arg1();
+  int flags = (int)regs.orig_arg1();
   // If these flags aren't set, the corresponding clone parameters may be
   // invalid pointers, so make sure they're ignored.
   if (!(flags & (CLONE_PARENT_SETTID | CLONE_PIDFD))) {
@@ -1324,9 +1334,14 @@ string find_helper_library(const char *basepath)
 vector<string> read_proc_status_fields(pid_t tid, const char* name,
                                        const char* name2, const char* name3) {
   vector<string> result;
+  FILE *f;
   char buf[1000];
-  sprintf(buf, "/proc/%d/status", tid);
-  FILE* f = fopen(buf, "r");
+  if (tid == 0) {
+    f = fopen("/proc/self/status", "r");
+  } else {
+    sprintf(buf, "/proc/%d/status", tid);
+    f = fopen(buf, "r");
+  }
   if (!f) {
     return result;
   }
@@ -1704,6 +1719,7 @@ ScopedFd open_socket(const char* address, unsigned short* port,
 
 void notifying_abort() {
   flush_log_buffer();
+  dump_rr_stack();
 
   char* test_monitor_pid = getenv("RUNNING_UNDER_TEST_MONITOR");
   if (test_monitor_pid) {
@@ -1712,8 +1728,6 @@ void notifying_abort() {
     // do so.
     kill(pid, SIGURG);
     sleep(10000);
-  } else {
-    dump_rr_stack();
   }
 
   abort();
@@ -1722,9 +1736,14 @@ void notifying_abort() {
 void dump_rr_stack() {
   static const char msg[] = "=== Start rr backtrace:\n";
   write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
+#if EXECINFO_H
   void* buffer[1024];
   int count = backtrace(buffer, 1024);
   backtrace_symbols_fd(buffer, count, STDERR_FILENO);
+#else
+  static const char msg_fallback[] = "<rr backtraces not available on this system>\n";
+  write_all(STDERR_FILENO, msg_fallback, sizeof(msg_fallback) - 1);
+#endif
   static const char msg2[] = "=== End rr backtrace\n";
   write_all(STDERR_FILENO, msg2, sizeof(msg2) - 1);
 }
@@ -1801,7 +1820,7 @@ TempFile create_temporary_file(const char* pattern) {
   snprintf(buf, sizeof(buf) - 1, "%s/%s", tmp_dir(), pattern);
   buf[sizeof(buf) - 1] = 0;
   TempFile result;
-  result.fd = mkstemp(buf);
+  result.fd = ScopedFd(mkstemp(buf));
   result.name = buf;
   return result;
 }
@@ -1826,7 +1845,7 @@ static ScopedFd create_tmpfs_file(const string &real_name) {
   name = name.substr(0, 255);
 
   ScopedFd fd =
-      open(name.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0700);
+      ScopedFd(name.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0700);
   /* Remove the fs name so that we don't have to worry about
    * cleaning up this segment in error conditions. */
   unlink(name.c_str());
@@ -1870,8 +1889,12 @@ vector<string> current_env() {
 }
 
 int get_num_cpus() {
-  int cpus = (int)sysconf(_SC_NPROCESSORS_ONLN);
-  return cpus > 0 ? cpus : 1;
+  cpu_set_t affinity_mask;
+  int ret = sched_getaffinity(0, sizeof(affinity_mask), &affinity_mask);
+  if (ret < 0) {
+    FATAL() << "sched_getaffinity failed";
+  }
+  return CPU_COUNT(&affinity_mask);
 }
 
 static const uint8_t rdtsc_insn[] = { 0x0f, 0x31 };
@@ -1959,58 +1982,6 @@ bool is_advanced_pc_and_signaled_instruction(Task* t, remote_code_ptr ip) {
   return false;
 }
 
-/**
- * Read and parse the available CPU list then select a random CPU from the list.
- */
-static vector<int> get_cgroup_cpus() {
-  vector<int> cpus;
-  ifstream self_cpuset("/proc/self/cpuset");
-  if (!self_cpuset.is_open()) {
-    return cpus;
-  }
-  string cpuset_path;
-  getline(self_cpuset, cpuset_path);
-  self_cpuset.close();
-  if (cpuset_path.empty()) {
-    return cpus;
-  }
-  ifstream cpuset("/sys/fs/cgroup/cpuset" + cpuset_path + "/cpuset.cpus");
-  if (!cpuset.good()) {
-    return cpus;
-  }
-  while (true) {
-    int cpu1;
-    cpuset >> cpu1;
-    if (cpuset.fail()) {
-      return std::vector<int>{};
-    }
-    cpus.push_back(cpu1);
-    char c = cpuset.get();
-    if (cpuset.eof() || c == '\n') {
-      break;
-    } else if (c == ',') {
-      continue;
-    } else if (c != '-') {
-      return std::vector<int>{};;
-    }
-    int cpu2;
-    cpuset >> cpu2;
-    if (cpuset.fail()) {
-      return std::vector<int>{};
-    }
-    for (int cpu = cpu1 + 1; cpu <= cpu2; cpu++) {
-      cpus.push_back(cpu);
-    }
-    c = cpuset.get();
-    if (cpuset.eof() || c == '\n') {
-      break;
-    } else if (c != ',') {
-      return std::vector<int>{};
-    }
-  }
-  return cpus;
-}
-
 static string get_cpu_lock_file() {
   const char* lock_file = getenv("_RR_CPU_LOCK_FILE");
   return lock_file ? lock_file : trace_save_dir() + "/cpu_lock";
@@ -2025,11 +1996,23 @@ int choose_cpu(BindCPU bind_cpu, ScopedFd &cpu_lock_fd_out) {
     return -1;
   }
 
-  // Find out which CPUs we're allowed to run on at all
-  std::vector<int> cpus = get_cgroup_cpus();
+  // Find out which CPUs we're allowed to run on at all.
+  // sched_getaffinity intersects the task's `cpu_mask`
+  // (/proc/.../status Cpus_allowed_list) with `cpu_active_mask`
+  // which is almost the same as /sys/devices/system/cpu/online
+  cpu_set_t affinity_mask;
+  int ret = sched_getaffinity(0, sizeof(affinity_mask), &affinity_mask);
+  if (ret < 0) {
+    FATAL() << "sched_getaffinity failed";
+  }
+  std::vector<int> cpus;
+  for (int i = 0; i < CPU_SETSIZE; ++i) {
+    if (CPU_ISSET(i, &affinity_mask)) {
+      cpus.push_back(i);
+    }
+  }
   if (cpus.empty()) {
-    cpus.resize(get_num_cpus());
-    std::iota(cpus.begin(), cpus.end(), 0);
+    FATAL() << "Can't find a valid CPU to run on";
   }
 
   // When many copies of rr are running on the same machine, it's easy for them
@@ -2045,8 +2028,9 @@ int choose_cpu(BindCPU bind_cpu, ScopedFd &cpu_lock_fd_out) {
     struct stat stat;
     int err = fstat(cpu_lock_fd_out, &stat);
     DEBUG_ASSERT(err == 0);
-    if (stat.st_size < get_num_cpus()) {
-      if (ftruncate(cpu_lock_fd_out, get_num_cpus())) {
+    int configured_cpus = (int)sysconf(_SC_NPROCESSORS_CONF);
+    if (stat.st_size < configured_cpus) {
+      if (ftruncate(cpu_lock_fd_out, configured_cpus)) {
         FATAL() << "Failed to resize locks file";
       }
     }
@@ -2381,7 +2365,7 @@ void SAFE_FATAL(int err, const char *msg)
     {.iov_base = (char*)msg, .iov_len=strlen(msg)},
     {.iov_base = nl, .iov_len=sizeof(nl)}
   };
-  (void)::writev(STDERR_FILENO, out, sizeof(out)/sizeof(struct iovec));
+  __attribute__((unused)) ssize_t ret = ::writev(STDERR_FILENO, out, sizeof(out)/sizeof(struct iovec));
   abort();
 }
 
@@ -2430,4 +2414,36 @@ bool coredumping_signal_takes_down_entire_vm() {
   return coredumping_signal_vm_behavior > 0;
 }
 
+int parse_tid_from_proc_path(const std::string& pathname,
+                             const std::string& property) {
+  // XXX When rr becomes c++17 - use string view instead. Has better API for
+  // this stuff.
+  const auto proc_length = 6;
+  const auto prop_should_begin =
+      pathname.size() - property.size() - (pathname.back() == '/');
+  if (pathname.substr(prop_should_begin, property.size()) == property) {
+    const auto task = "task/"s;
+    const auto pos = pathname.find(task);
+    if (pos == std::string::npos) {
+      auto s = pathname.substr(proc_length);
+      if (pathname.back() == '/')
+        s.pop_back();
+      char* end;
+      const int tid = strtol(s.c_str(), &end, 10);
+      if (end == property) {
+        return tid;
+      }
+    } else {
+      auto s = pathname.substr(pos + task.size());
+      if (pathname.back() == '/')
+        s.pop_back();
+      char* end;
+      const int tid = strtol(s.c_str(), &end, 10);
+      if (end == property) {
+        return tid;
+      }
+    }
+  }
+  return -1;
+}
 } // namespace rr

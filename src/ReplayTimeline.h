@@ -89,6 +89,7 @@ public:
    * Use ReplayTimeline's breakpoint methods.
    */
   ReplaySession& current_session() { return *current; }
+  const ReplaySession& current_session() const { return *current; }
 
   /**
    * Return a mark for the current state. A checkpoint need not be retained,
@@ -208,7 +209,7 @@ public:
    * replay_step_forward only does one replay step. That means we'll only
    * execute code in current_session().current_task().
    */
-  ReplayResult replay_step_forward(RunCommand command, FrameTime stop_at_time);
+  ReplayResult replay_step_forward(RunCommand command);
 
   ReplayResult reverse_continue(
       const std::function<bool(ReplayTask* t)>& stop_filter,

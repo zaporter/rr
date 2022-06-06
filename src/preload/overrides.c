@@ -26,13 +26,24 @@
 #endif
 #endif
 
+static int (*real_pthread_mutex_init)(void* mutex, const void* attr);
+static int (*real_pthread_mutex_lock)(void* mutex);
+static int (*real_pthread_mutex_trylock)(void* mutex);
+static int (*real_pthread_mutex_timedlock)(void* mutex,
+                                           const struct timespec* abstime);
+
+static void __attribute__((constructor)) init_override(void) {
+  real_pthread_mutex_init = dlsym(RTLD_NEXT, "pthread_mutex_init");
+  real_pthread_mutex_lock = dlsym(RTLD_NEXT, "pthread_mutex_lock");
+  real_pthread_mutex_trylock = dlsym(RTLD_NEXT, "pthread_mutex_trylock");
+  real_pthread_mutex_timedlock = dlsym(RTLD_NEXT, "pthread_mutex_timedlock");
+}
+
 static void fix_mutex_kind(pthread_mutex_t* mutex) {
   /* Disable priority inheritance. */
   mutex->__data.__kind &= ~PTHREAD_MUTEX_PRIO_INHERIT_NP;
 }
 
-extern int __pthread_mutex_init(pthread_mutex_t* mutex,
-                                const pthread_mutexattr_t* attr);
 #ifdef DOUBLE_UNDERSCORE_PTHREAD_LOCK_AVAILABLE
 /*
  * We need to able to call directly to __pthread_mutex_lock and
@@ -42,6 +53,8 @@ extern int __pthread_mutex_init(pthread_mutex_t* mutex,
  * to use a pthreads-based implementation). So before our pointers are set
  * up, call these.
  */
+extern int __pthread_mutex_init(pthread_mutex_t* mutex,
+                                const pthread_mutexattr_t* attr);
 extern int __pthread_mutex_lock(pthread_mutex_t* mutex);
 extern int __pthread_mutex_trylock(pthread_mutex_t* mutex);
 #endif
@@ -51,25 +64,28 @@ int pthread_mutex_init(pthread_mutex_t* mutex,
   int ret;
   pthread_mutexattr_t realattr;
 
-  if (!attr) {
-    return __pthread_mutex_init(mutex, NULL);
+  if (attr) {
+    /* We wish to enforce the use of plain (no PI) mutex to avoid
+     * needing to handle PI futex() operations.
+     * We also wish to ensure that pthread_mutexattr_getprotocol()
+     * still returns the requested protocol.
+     * So we copy the attribute and force PTHREAD_PRIO_NONE.
+     */
+    memcpy(&realattr, attr, sizeof(realattr));
+    ret = pthread_mutexattr_setprotocol(&realattr, PTHREAD_PRIO_NONE);
+    if (ret) {
+      return ret;
+    }
+    attr = &realattr;
   }
-
-  /* We wish to enforce the use of plain (no PI) mutex to avoid
-   * needing to handle PI futex() operations.
-   * We also wish to ensure that pthread_mutexattr_getprotocol()
-   * still returns the requested protocol.
-   * So we copy the attribute and force PTHREAD_PRIO_NONE.
-   */
-  memcpy(&realattr, attr, sizeof(realattr));
-  ret = pthread_mutexattr_setprotocol(&realattr, PTHREAD_PRIO_NONE);
-  if (ret) {
-    return ret;
+  if (!real_pthread_mutex_init) {
+#ifdef DOUBLE_UNDERSCORE_PTHREAD_LOCK_AVAILABLE
+    return __pthread_mutex_init(mutex, attr);
+#else
+    real_pthread_mutex_init = dlsym(RTLD_NEXT, "pthread_mutex_init");
+#endif
   }
-  if (real_pthread_mutex_init) {
-    return real_pthread_mutex_init(mutex, &realattr);
-  }
-  return __pthread_mutex_init(mutex, &realattr);
+  return real_pthread_mutex_init(mutex, attr);
 }
 
 /* Prevent use of lock elision; Haswell's TSX/RTM features used by
@@ -111,30 +127,6 @@ int pthread_mutex_trylock(pthread_mutex_t* mutex) {
   return real_pthread_mutex_trylock(mutex);
 }
 
-/**
- * Exported glibc synonym for |sysconf()|.  We can't use |dlsym()| to
- * resolve the next "sysconf" symbol, because
- *  - dlysym usually calls malloc()
- *  - custom allocators like jemalloc may use sysconf()
- *  - if our sysconf wrapper is re-entered during initialization, it
- *    has nothing to fall back on to get the conf name, and chaos will
- *    likely ensue if we return something random.
- */
-long __sysconf(int name);
-
-/**
- *  Pretend that only 1 processor is configured/online, because rr
- *  binds all tracees to one logical CPU.
- */
-long sysconf(int name) {
-  switch (name) {
-    case _SC_NPROCESSORS_ONLN:
-    case _SC_NPROCESSORS_CONF:
-      return globals.pretend_num_cores ? globals.pretend_num_cores : 1;
-  }
-  return __sysconf(name);
-}
-
 typedef void* Dlopen(const char* filename, int flags);
 
 void* dlopen(const char* filename, int flags) {
@@ -162,6 +154,9 @@ void* XShmCreateImage(__attribute__((unused)) register void* dpy,
   return 0;
 }
 
+RR_HIDDEN char impose_syscall_delay;
+RR_HIDDEN char impose_spurious_desched;
+
 /**
  * This is for testing purposes only.
  */
@@ -184,10 +179,13 @@ void spurious_desched_syscall(struct syscall_info* info) {
   impose_spurious_desched = 0;
 }
 
+#ifndef __aarch64__
+
 /**
  * glibc geteuid() can be compiled to instructions ending in "syscall; ret"
  * which sometimes can't be hooked. So override it here with something that
  * can be hooked.
+ * This is not an issue on aarch64 since we only need to patch a single instruction.
  */
 uid_t geteuid(void) {
 #ifdef __i386__
@@ -254,3 +252,5 @@ void _ZNSt13random_device7_M_initERKSs(void* this,
   }
   random_init(this, token);
 }
+
+#endif

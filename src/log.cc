@@ -3,6 +3,7 @@
 #include "log.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 #include <deque>
 #include <fstream>
@@ -17,10 +18,28 @@
 #include "RecordSession.h"
 #include "core.h"
 #include "ftrace.h"
+#include "kernel_abi.h"
 #include "kernel_metadata.h"
 #include "util.h"
 
 using namespace std;
+
+ostream& operator<<(ostream& stream, const siginfo_t& siginfo) {
+  stream << "{signo:" << rr::signal_name(siginfo.si_signo)
+         << ",errno:" << rr::errno_name(siginfo.si_errno)
+         << ",code:" << rr::sicode_name(siginfo.si_code, siginfo.si_signo);
+  switch (siginfo.si_signo) {
+    case SIGILL:
+    case SIGFPE:
+    case SIGSEGV:
+    case SIGBUS:
+    case SIGTRAP:
+      stream << ",addr:" << siginfo.si_addr;
+      break;
+  }
+  stream << "}";
+  return stream;
+}
 
 namespace rr {
 

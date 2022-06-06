@@ -204,10 +204,10 @@ static bool handle_ptrace_exit_event(RecordTask* t) {
         // exiting, it doesn't matter if we don't reset the syscallbuf.
         // XXX flushing the syscallbuf may be risky too...
         auto event = Event::sched();
-        if (t->is_in_syscallbuf()) {
-          event.Sched().in_syscallbuf_syscall_hook = t->syscallbuf_code_layout.syscallbuf_syscall_hook;
-          ASSERT(t, event.Sched().in_syscallbuf_syscall_hook != remote_code_ptr());
-        }
+        // When replaying this SCHED, we won't proceed past the `syscall_hook`
+        // entry point. Code inside the syscallbuf may be in a bad state during
+        // replay because we didn't save buffered syscalls.
+        event.Sched().in_syscallbuf_syscall_hook = t->syscallbuf_code_layout.syscallbuf_syscall_hook;
         t->record_event(event, RecordTask::FLUSH_SYSCALLBUF,
                         RecordTask::DONT_RESET_SYSCALLBUF);
       }
@@ -533,22 +533,7 @@ static void handle_seccomp_trap(RecordTask* t,
   si.native_api.si_signo = SIGSYS;
   si.native_api.si_errno = seccomp_data;
   si.native_api.si_code = SYS_SECCOMP;
-  switch (r.arch()) {
-    case x86:
-      si.native_api._sifields._sigsys._arch = AUDIT_ARCH_I386;
-      break;
-    case x86_64:
-      si.native_api._sifields._sigsys._arch = AUDIT_ARCH_X86_64;
-      break;
-    #ifdef AUDIT_ARCH_AARCH64
-    case aarch64:
-      si.native_api._sifields._sigsys._arch = AUDIT_ARCH_AARCH64;
-      break;
-    #endif
-    default:
-      DEBUG_ASSERT(0 && "Unknown architecture");
-      break;
-  }
+  si.native_api._sifields._sigsys._arch = to_audit_arch(r.arch());
   si.native_api._sifields._sigsys._syscall = syscallno;
   // Documentation says that si_call_addr is the address of the syscall
   // instruction, but in tests it's immediately after the syscall
@@ -731,9 +716,25 @@ bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
         t->did_waitpid(status);
       }
       t->post_exec();
+      t->session().scheduler().did_exit_execve(t);
 
-      // Skip past the ptrace event.
-      step_state->continue_type = CONTINUE_SYSCALL;
+      // Forward ptrace exec notification
+      if (t->emulated_ptracer) {
+        if (t->emulated_ptrace_options & PTRACE_O_TRACEEXEC) {
+          t->emulate_ptrace_stop(
+              WaitStatus::for_ptrace_event(PTRACE_EVENT_EXEC));
+        } else if (!t->emulated_ptrace_seized) {
+          // Inject legacy SIGTRAP-after-exec
+          t->tgkill(SIGTRAP);
+        }
+      }
+
+      if (t->emulated_stop_pending) {
+        step_state->continue_type = DONT_CONTINUE;
+      } else {
+        // Skip past the ptrace event.
+        step_state->continue_type = CONTINUE_SYSCALL;
+      }
       break;
     }
 
@@ -887,6 +888,9 @@ static void advance_to_disarm_desched_syscall(RecordTask* t) {
     if (t->is_dying()) {
       return;
     }
+    if (t->status().is_syscall()) {
+      t->apply_syscall_entry_regs();
+    }
     /* We can safely ignore TIME_SLICE_SIGNAL while trying to
      * reach the disarm-desched ioctl: once we reach it,
      * the desched'd syscall will be "done" and the tracee
@@ -1033,11 +1037,11 @@ static void copy_syscall_arg_regs(Registers* to, const Registers& from) {
 
 static void maybe_trigger_emulated_ptrace_syscall_exit_stop(RecordTask* t) {
   if (t->emulated_ptrace_cont_command == PTRACE_SYSCALL) {
-    t->emulate_ptrace_stop(WaitStatus::for_syscall(t));
+    t->emulate_ptrace_stop(WaitStatus::for_syscall(t), SYSCALL_EXIT_STOP);
   } else if (is_ptrace_any_singlestep(t->arch(), t->emulated_ptrace_cont_command)) {
     // Deliver the singlestep trap now that we've finished executing the
     // syscall.
-    t->emulate_ptrace_stop(WaitStatus::for_stop_sig(SIGTRAP), nullptr,
+    t->emulate_ptrace_stop(WaitStatus::for_stop_sig(SIGTRAP), SIGNAL_DELIVERY_STOP, nullptr,
                            SI_KERNEL);
   }
 }
@@ -1324,7 +1328,7 @@ void RecordSession::check_initial_task_syscalls(RecordTask* t,
 RecordTask* RecordSession::revive_task_for_exec(pid_t rec_tid) {
   unsigned long msg = 0;
   int ret =
-      ptrace(__ptrace_request(PTRACE_GETEVENTMSG), rec_tid, nullptr, &msg);
+      ptrace(_ptrace_request(PTRACE_GETEVENTMSG), rec_tid, nullptr, &msg);
   if (ret < 0) {
     FATAL() << "Can't get old tid for execve (leader=" << rec_tid << ")";
   }
@@ -1410,11 +1414,6 @@ static bool preinject_signal(RecordTask* t) {
      */
     LOG(debug) << "    maybe not in signal-stop (status " << t->status()
                << "); doing tgkill(SYSCALLBUF_DESCHED_SIGNAL)";
-    // Always send SYSCALLBUF_DESCHED_SIGNAL because other signals (except
-    // TIME_SLICE_SIGNAL) will be blocked by
-    // RecordTask::will_resume_execution().
-    t->tgkill(t->session().syscallbuf_desched_sig());
-
     t->move_to_signal_stop();
 
     if (t->status().ptrace_event() == PTRACE_EVENT_EXIT) {
@@ -1633,7 +1632,12 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
               r.set_syscallno(syscall_number_for_restart_syscall(t->arch()));
               break;
           }
-          r.set_ip(r.ip().decrement_by_syscall_insn_length(t->arch()));
+          // On aarch64, the kernel modifies the registers before the signal stop.
+          // so we should not decrement the pc again or we'll rerun the instruction
+          // before the syscall.
+          // [1] https://github.com/torvalds/linux/blob/caffb99b6929f41a69edbb5aef3a359bf45f3315/arch/arm64/kernel/signal.c#L855-L862
+          if (t->arch() != aarch64)
+            r.set_ip(r.ip().decrement_by_syscall_insn_length(t->arch()));
           // Now that we've mucked with the registers, we can't switch tasks. That
           // could allow more signals to be generated, breaking our assumption
           // that we are the last signal.
@@ -1841,7 +1845,7 @@ static bool is_ptrace_any_sysemu(SupportedArch arch, int command)
 bool RecordSession::process_syscall_entry(RecordTask* t, StepState* step_state,
                                           RecordResult* step_result,
                                           SupportedArch syscall_arch) {
-  if (const siginfo_t* si = t->stashed_sig_not_synthetic_SIGCHLD()) {
+  if (const RecordTask::StashedSignal* sig = t->stashed_sig_not_synthetic_SIGCHLD()) {
     // The only four cases where we allow a stashed signal to be pending on
     // syscall entry are:
     // -- the signal is a ptrace-related signal, in which case if it's generated
@@ -1864,7 +1868,9 @@ bool RecordSession::process_syscall_entry(RecordTask* t, StepState* step_state,
                        ->privileged_traced_syscall_ip()
                        .increment_by_syscall_insn_length(t->arch()))
       << "Stashed signal pending on syscall entry when it shouldn't be: "
-      << *si << "; IP=" << t->ip();
+      << sig->siginfo << "; regs=" << t->regs()
+      << "; last_execution_resume=" << t->last_execution_resume()
+      << "; sig ip=" << sig->ip;
   }
 
   // We just entered a syscall.
@@ -1907,7 +1913,7 @@ bool RecordSession::process_syscall_entry(RecordTask* t, StepState* step_state,
         t->emulated_ptrace_cont_command)) &&
       !is_in_privileged_syscall(t)) {
     t->ev().Syscall().state = ENTERING_SYSCALL_PTRACE;
-    t->emulate_ptrace_stop(WaitStatus::for_syscall(t));
+    t->emulate_ptrace_stop(WaitStatus::for_syscall(t), SYSCALL_ENTRY_STOP);
     t->record_current_event();
 
     t->ev().Syscall().in_sysemu = is_ptrace_any_sysemu(t->arch(),
@@ -2076,11 +2082,59 @@ void strip_outer_ld_preload(vector<string>& env) {
   }
 }
 
+static const MemoryRange asan_shadow(remote_ptr<void>((uintptr_t)0x00007fff7000LL),
+                                     remote_ptr<void>((uintptr_t)0x10007fff8000LL));
+static const MemoryRange asan_allocator_reserved(remote_ptr<void>((uintptr_t)0x600000000000LL),
+                                                 remote_ptr<void>((uintptr_t)0x640000000000LL));
+
+// See https://github.com/llvm/llvm-project/blob/main/compiler-rt/lib/tsan/rtl/tsan_platform_posix.cpp
+static const MemoryRange tsan_shadow(remote_ptr<void>((uintptr_t)0x008000000000LL),
+                                     remote_ptr<void>((uintptr_t)0x550000000000LL));
+// The memory area 0x7b0000000000-0x7c0000000000 is reserved for TSAN's
+// custom heap allocator --- applications end up using it, but *we* can't use
+// it.
+static const MemoryRange tsan_exclude(remote_ptr<void>((uintptr_t)0x568000000000LL),
+                                      remote_ptr<void>((uintptr_t)0x7e8000000000LL));
+// It's only 1TB because tsan can't fit more
+static const MemoryRange tsan_fixed_global_exclusion_range(remote_ptr<void>((uintptr_t)0x7e8000000000LL),
+                                                           remote_ptr<void>((uintptr_t)0x7f8000000000LL));
+
 struct ExeInfo {
-  ExeInfo() : has_asan_symbols(false) {}
+  ExeInfo() : arch(NativeArch::arch()) {}
+  SupportedArch arch;
   // Empty if anything fails
-  string libasan_path;
-  bool has_asan_symbols;
+  string sanitizer_path;
+  vector<MemoryRange> sanitizer_exclude_memory_ranges;
+  // If non-empty, use this as the global exclusion range.
+  MemoryRange fixed_global_exclusion_range;
+
+  void setup_asan_memory_ranges() {
+    if (!check_sanitizer_arch()) {
+      return;
+    }
+    sanitizer_exclude_memory_ranges.push_back(asan_shadow);
+    sanitizer_exclude_memory_ranges.push_back(asan_allocator_reserved);
+  }
+  void setup_tsan_memory_ranges() {
+    if (!check_sanitizer_arch()) {
+      return;
+    }
+    sanitizer_exclude_memory_ranges.push_back(tsan_shadow);
+    sanitizer_exclude_memory_ranges.push_back(tsan_exclude);
+    fixed_global_exclusion_range = tsan_fixed_global_exclusion_range;
+  }
+private:
+  bool check_sanitizer_arch() {
+    switch (arch) {
+      case x86_64:
+        return true;
+      default:
+        // We have no idea what's going on. Disable mmap randomization if
+        // chaos mode is active.
+        sanitizer_exclude_memory_ranges.push_back(MemoryRange::all());
+        return false;
+    }
+  }
 };
 
 static ExeInfo read_exe_info(const string& exe_file) {
@@ -2090,13 +2144,18 @@ static ExeInfo read_exe_info(const string& exe_file) {
     return ret;
   }
   ElfFileReader reader(fd);
+  ret.arch = reader.arch();
 
   DynamicSection dynamic = reader.read_dynamic();
   for (auto& entry : dynamic.entries) {
     if (entry.tag == DT_NEEDED && entry.val < dynamic.strtab.size()) {
       const char* name = &dynamic.strtab[entry.val];
       if (!strncmp(name, "libasan", 7)) {
-        ret.libasan_path = string(name);
+        ret.sanitizer_path = string(name);
+        ret.setup_asan_memory_ranges();
+      } else if (!strncmp(name, "libtsan", 7)) {
+        ret.sanitizer_path = string(name);
+        ret.setup_tsan_memory_ranges();
       }
     }
   }
@@ -2104,7 +2163,9 @@ static ExeInfo read_exe_info(const string& exe_file) {
   auto syms = reader.read_symbols(".dynsym", ".dynstr");
   for (size_t i = 0; i < syms.size(); ++i) {
     if (syms.is_name(i, "__asan_init")) {
-      ret.has_asan_symbols = true;
+      ret.setup_asan_memory_ranges();
+    } else if (syms.is_name(i, "__tsan_init")) {
+      ret.setup_tsan_memory_ranges();
     }
   }
 
@@ -2208,6 +2269,9 @@ static string lookup_by_path(const string& name) {
     CLEAN_FATAL() << "Provided tracee '" << argv[0] << "' is a directory, not an executable";
   }
   ExeInfo exe_info = read_exe_info(full_path);
+  if (force_asan_active && exe_info.sanitizer_exclude_memory_ranges.empty()) {
+    exe_info.setup_asan_memory_ranges();
+  }
 
   // Strip any LD_PRELOAD that an outer rr may have inserted
   strip_outer_ld_preload(env);
@@ -2216,11 +2280,11 @@ static string lookup_by_path(const string& name) {
   string syscall_buffer_lib_path = find_helper_library(SYSCALLBUF_LIB_FILENAME);
   if (!syscall_buffer_lib_path.empty()) {
     string ld_preload = "";
-    if (!exe_info.libasan_path.empty()) {
-      LOG(debug) << "Prepending " << exe_info.libasan_path << " to LD_PRELOAD";
+    if (!exe_info.sanitizer_path.empty()) {
+      LOG(debug) << "Prepending " << exe_info.sanitizer_path << " to LD_PRELOAD";
       // Put an LD_PRELOAD entry for it before our preload library, because
       // it checks that it's loaded first
-      ld_preload += exe_info.libasan_path + ":";
+      ld_preload += exe_info.sanitizer_path + ":";
     }
     ld_preload += syscall_buffer_lib_path + SYSCALLBUF_LIB_FILENAME_PADDED;
     inject_ld_helper_library(env, "LD_PRELOAD", ld_preload);
@@ -2251,8 +2315,8 @@ static string lookup_by_path(const string& name) {
   if (!Session::has_cpuid_faulting()) {
     // OpenSSL uses RDRAND, but we can disable it. These bitmasks are inverted
     // and ANDed with the results of CPUID. The number below is 2^62, which is the
-    // bit for RDRAND support, and 2^29, which is the bit for SHA support.
-    env.push_back("OPENSSL_ia32cap=~4611686018427387904:~536870912");
+    // bit for RDRAND support.
+    env.push_back("OPENSSL_ia32cap=~4611686018427387904:0");
     // Disable Qt's use of RDRAND/RDSEED/RTM
     env.push_back("QT_NO_CPU_FEATURE=rdrnd rdseed rtm");
     // Disable systemd's use of RDRAND
@@ -2263,9 +2327,8 @@ static string lookup_by_path(const string& name) {
       new RecordSession(full_path, argv, env, disable_cpuid_features,
                         syscallbuf, syscallbuf_desched_sig, bind_cpu,
                         output_trace_dir, trace_id, use_audit, unmap_vdso));
-  session->set_asan_active(force_asan_active ||
-                           !exe_info.libasan_path.empty() ||
-                           exe_info.has_asan_symbols);
+  session->excluded_ranges_ = std::move(exe_info.sanitizer_exclude_memory_ranges);
+  session->fixed_global_exclusion_range_ = std::move(exe_info.fixed_global_exclusion_range);
   return session;
 }
 
@@ -2293,7 +2356,6 @@ RecordSession::RecordSession(const std::string& exe_path,
       use_file_cloning_(true),
       use_read_cloning_(true),
       enable_chaos_(false),
-      asan_active_(false),
       wait_for_all_(false),
       use_audit_(use_audit),
       unmap_vdso_(unmap_vdso) {
@@ -2307,7 +2369,7 @@ RecordSession::RecordSession(const std::string& exe_path,
   }
 
   trace_out.set_bound_cpu(choose_cpu(bind_cpu, cpu_lock));
-  do_bind_cpu(trace_out);
+  do_bind_cpu();
   ScopedFd error_fd = create_spawn_task_error_pipe();
   RecordTask* t = static_cast<RecordTask*>(
       Task::spawn(*this, error_fd, &tracee_socket_fd(),
@@ -2404,6 +2466,7 @@ RecordSession::RecordResult RecordSession::record_step() {
       handle_ptrace_event(&t, &step_state, &result, &did_enter_syscall)) {
     if (result.status != STEP_CONTINUE ||
         step_state.continue_type == DONT_CONTINUE) {
+      last_task_switchable = ALLOW_SWITCH;
       return result;
     }
 
@@ -2474,6 +2537,12 @@ void RecordSession::terminate_tracees() {
       t->sent_shutdown_kill = true;
       t->emulate_SIGCONT();
     }
+  }
+}
+
+void RecordSession::forward_SIGTERM() {
+  if (!initial_thread_group->task_set().empty()) {
+    kill(initial_thread_group->tgid, SIGTERM);
   }
 }
 

@@ -313,32 +313,35 @@ public:
 
   std::string read_spawned_task_error() const;
 
+  /* Returns an empty mapping if the tracee died */
   static KernelMapping create_shared_mmap(
       AutoRemoteSyscalls& remote, size_t size, remote_ptr<void> map_hint,
       const char* name, int tracee_prot = PROT_READ | PROT_WRITE,
       int tracee_flags = 0,
       MonitoredSharedMemory::shr_ptr&& monitored = nullptr);
 
-  static bool make_private_shared(AutoRemoteSyscalls& remote,
+  static void make_private_shared(AutoRemoteSyscalls& remote,
                                   const AddressSpace::Mapping m);
   enum PreserveContents {
     PRESERVE_CONTENTS,
     DISCARD_CONTENTS,
   };
   // Recreate an mmap region that is shared between rr and the tracee. The
-  // caller
-  // is responsible for recreating the data in the new mmap, if `preserve` is
+  // caller is responsible for recreating the data in the new mmap, if `preserve` is
   // DISCARD_CONTENTS.
   // OK to call this while 'm' references one of the mappings in remote's
-  // AddressSpace
-  static const AddressSpace::Mapping& recreate_shared_mmap(
+  // AddressSpace.
+  // Returns an empty Mapping if the tracee died unexpectedly.
+  static const AddressSpace::Mapping recreate_shared_mmap(
       AutoRemoteSyscalls& remote, const AddressSpace::Mapping& m,
       PreserveContents preserve = DISCARD_CONTENTS,
       MonitoredSharedMemory::shr_ptr&& monitored = nullptr);
 
   /* Takes a mapping and replaces it by one that is shared between rr and
      the tracee. The caller is responsible for filling the contents of the
-      new mapping. */
+      new mapping.
+      Returns an empty mapping if the tracee unexpectedly died.
+   */
   static const AddressSpace::Mapping& steal_mapping(
       AutoRemoteSyscalls& remote, const AddressSpace::Mapping& m,
       MonitoredSharedMemory::shr_ptr&& monitored = nullptr);
@@ -362,7 +365,7 @@ public:
   virtual TraceStream* trace_stream() { return nullptr; }
   TicksSemantics ticks_semantics() const { return ticks_semantics_; }
 
-  virtual int cpu_binding(TraceStream& trace) const;
+  virtual int cpu_binding() const;
 
   int syscall_number_for_rrcall_init_preload() const {
     return SYS_rrcall_init_preload - RR_CALL_BASE + rrcall_base_;
@@ -391,7 +394,7 @@ public:
 
   /* Bind the current process to the a CPU as specified in the session options
      or trace */
-  void do_bind_cpu(TraceStream &trace);
+  void do_bind_cpu();
 
   const ThreadGroupMap& thread_group_map() const { return thread_group_map_; }
 

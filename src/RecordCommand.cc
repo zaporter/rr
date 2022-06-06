@@ -208,11 +208,10 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
       flags.use_file_cloning = false;
       break;
     case 2:
-      if (!opt.verify_valid_int(4, 1024 * 1024) ||
-          (opt.int_value & (page_size() / 1024 - 1))) {
+      if (!opt.verify_valid_int(4, 1024 * 1024)) {
         return false;
       }
-      flags.syscall_buffer_size = opt.int_value * 1024;
+      flags.syscall_buffer_size = ceil_page_size(opt.int_value * 1024);
       break;
     case 3:
       if (opt.value == "default" || opt.value == "error") {
@@ -394,13 +393,17 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
 
 static volatile double term_requested;
 
+static const double TRACEE_SIGTERM_RESPONSE_MAX_TIME = 5;
+
 /**
  * A terminating signal was received.
  *
- * If a term request has been pending for more than one second,
+ * First we forward it to the tracee. Then if the tracee is still
+ * running after 1s + TRACEE_SIGTERM_RESPONSE_MAX_TIME, we kill it with SIGKILL.
+ * If a term request remains pending for more than one second,
  * then assume rr is wedged and abort().
  *
- * Note that this is not only called in a signal handler but it could
+ * Note that this is called in a signal handler and could also
  * be called off the main thread.
  */
 static void handle_SIGTERM(__attribute__((unused)) int sig) {
@@ -408,7 +411,7 @@ static void handle_SIGTERM(__attribute__((unused)) int sig) {
   // that could allocate, we could deadlock.
   if (term_requested > 0) {
     double now = monotonic_now_sec();
-    if (now - term_requested > 1) {
+    if (now - term_requested > 1 + TRACEE_SIGTERM_RESPONSE_MAX_TIME) {
       static const char msg[] =
         "Received SIGTERM while an earlier one was pending.  We're "
         "probably wedged.\n";
@@ -523,6 +526,15 @@ static void save_rr_git_revision(const string& trace_dir) {
   }
 }
 
+static void* repeat_SIGTERM(__attribute__((unused)) void* p) {
+  sleep_time(TRACEE_SIGTERM_RESPONSE_MAX_TIME);
+  while (1) {
+    /* send another SIGTERM so we wake up and SIGKILL our tracees */
+    kill(getpid(), SIGTERM);
+    sleep_time(0.01);
+  }
+}
+
 static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
   LOG(info) << "Start recording...";
 
@@ -553,7 +565,9 @@ static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
   install_signal_handlers();
 
   RecordSession::RecordResult step_result;
+  bool did_forward_SIGTERM = false;
   bool did_term_detached_tasks = false;
+  pthread_t term_repeater_thread;
   do {
     bool done_initial_exec = session->done_initial_exec();
     step_result = session->record_step();
@@ -562,7 +576,17 @@ static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
       session->trace_writer().make_latest_trace();
     }
     if (term_requested) {
-      session->terminate_tracees();
+      if (monotonic_now_sec() - term_requested > TRACEE_SIGTERM_RESPONSE_MAX_TIME) {
+        /* time ran out for the tracee to respond to SIGTERM; kill everything */
+        session->terminate_tracees();
+      } else if (!did_forward_SIGTERM) {
+        session->forward_SIGTERM();
+        // Start a thread to send a SIGTERM to ourselves (again)
+        // in case the tracee doesn't respond to SIGTERM.
+        pthread_create(&term_repeater_thread, NULL, repeat_SIGTERM, NULL);
+        did_forward_SIGTERM = true;
+      }
+      /* Forward SIGTERM to detached tasks immediately */
       if (!did_term_detached_tasks) {
         session->term_detached_tasks();
         did_term_detached_tasks = true;

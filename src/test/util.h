@@ -178,27 +178,30 @@ inline static int atomic_puts(const char* str) {
 #define printf(...) USE_atomic_printf_INSTEAD
 #define puts(...) USE_atomic_puts_INSTEAD
 
-inline static int check_cond(int cond) {
+inline static int atomic_assert(int cond, const char *str,
+				const char *file, const int line) {
   if (!cond) {
-    atomic_printf("FAILED: errno=%d (%s)\n", errno, strerror(errno));
-  }
-  return cond;
-}
-
-inline static int atomic_assert(int cond, const char *str) {
-  if (!check_cond(cond)) {
-    atomic_printf("FAILED: !%s\n", str);
+    atomic_printf("FAILED at %s:%d: !(%s) errno:%d (%s)\n", file, line, str,
+		  errno, strerror(errno));
     raise(SIGABRT);
   }
   return 1;
 }
 
-#define test_assert(cond) atomic_assert(cond, #cond)
+#define test_assert(cond) atomic_assert(cond, #cond, __FILE__, __LINE__)
 
 /**
  * Return the calling task's id.
  */
 inline static pid_t sys_gettid(void) { return syscall(SYS_gettid); }
+
+/**
+ * get the current cpu/node
+ */
+inline static int sys_getcpu(unsigned int* cpu, unsigned int* node) {
+  /* The 'tcache' parameter is unused in all kernels rr works on */
+  return syscall(SYS_getcpu, cpu, node, (void*)0);
+}
 
 /**
  * Ensure that |len| bytes of |buf| are the same across recording and
@@ -471,6 +474,12 @@ inline static SyscallWrapper get_spurious_desched_syscall(void) {
 #endif
 #ifndef PR_SPEC_FORCE_DISABLE
 #define PR_SPEC_FORCE_DISABLE 8
+#endif
+#ifndef PR_SET_VMA
+#define PR_SET_VMA 0x53564d41
+#endif
+#ifndef PR_SET_VMA_ANON_NAME
+#define PR_SET_VMA_ANON_NAME 0
 #endif
 
 #endif /* RRUTIL_H */
