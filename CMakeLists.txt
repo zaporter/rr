@@ -53,6 +53,7 @@ configure_file(
 set(FLAGS_COMMON "-D__USE_LARGEFILE64 -pthread")
 set(supports32bit true)
 set(x86ish false)
+set(has_syscallbuf false)
 if (${CMAKE_SYSTEM_PROCESSOR} STREQUAL "aarch64")
   set(supports32bit false)
   set(FLAGS_COMMON "${FLAGS_COMMON} -march=armv8.3-a -moutline-atomics")
@@ -60,6 +61,7 @@ if (${CMAKE_SYSTEM_PROCESSOR} STREQUAL "aarch64")
   set(VDSO_NAME "LINUX_2.6.39")
 else()
   set(x86ish true)
+  set(has_syscallbuf true)
   set(FLAGS_COMMON "${FLAGS_COMMON} -msse2 -D__MMX__ -D__SSE__ -D__SSE2__")
   set(PRELOAD_LIBRARY_PAGE_SIZE 4096)
   set(VDSO_NAME "LINUX_2.6")
@@ -317,6 +319,17 @@ else()
   message(AUTHOR_WARNING "proc_service.h not present. Support for libthread_db.so is disabled.")
 endif()
 
+# Test only includes
+find_path(MQUEUE_H NAMES "mqueue.h")
+if(MQUEUE_H)
+  add_definitions(-DMQUEUE_H=1)
+endif()
+
+find_path(FANOTIFY_H NAMES "sys/fanotify.h")
+if(FANOTIFY_H)
+  add_definitions(-DFANOTIFY_H=1)
+endif()
+
 include(CheckSymbolExists)
 list(APPEND CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
 check_symbol_exists(LAV_CURRENT "link.h" RTLD_AUDIT)
@@ -324,6 +337,9 @@ if(NOT RTLD_AUDIT)
   message(AUTHOR_WARNING "Couldn't find rtld-audit support. librraudit skipped.")
 endif()
 list(REMOVE_ITEM CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+
+# Test only symbols
+check_symbol_exists(pthread_mutexattr_setrobust "pthread.h" HAVE_ROBUST_MUTEX)
 
 set(Python_ADDITIONAL_VERSIONS 3 3.8 3.7 3.6 3.5 3.4 3.3 3.2 3.1 3.0)
 find_package(PythonInterp 3 REQUIRED)
@@ -399,7 +415,7 @@ add_custom_command(TARGET rrpage POST_BUILD
 
 # Order matters here! syscall_hook.S must be immediately before syscallbuf.c,
 # raw_syscall.S must be before overrides.c, which must be last.
-if(x86ish)
+if(has_syscallbuf)
   set(PRELOAD_FILES
     syscall_hook.S
     syscallbuf.c
@@ -622,7 +638,12 @@ endif()
 
 # Add -flto option to linking step if release
 if(LOWERCASE_CMAKE_BUILD_TYPE STREQUAL "release")
-  set(RR_MAIN_LINKER_FLAGS "${RR_MAIN_LINKER_FLAGS} -flto")
+  CHECK_C_COMPILER_FLAG("-flto=auto" SUPPORTS_LTO_AUTO)
+  if(SUPPORTS_LTO_AUTO)
+    set(RR_MAIN_LINKER_FLAGS "${RR_MAIN_LINKER_FLAGS} -flto=auto")
+  else()
+    set(RR_MAIN_LINKER_FLAGS "${RR_MAIN_LINKER_FLAGS} -flto")
+  endif()
 endif()
 
 if(LIBRT)
@@ -913,7 +934,6 @@ set(BASIC_TESTS
   execveat
   exit_with_syscallbuf_signal
   fadvise
-  fanotify
   fatal_init_signal
   fatal_sigsegv_thread
   x86/fault_in_code_page
@@ -1025,7 +1045,6 @@ set(BASIC_TESTS
   mprotect_heterogenous
   mprotect_none
   mprotect_stack
-  mq
   mremap
   mremap_after_coalesce
   mremap_grow
@@ -1113,6 +1132,7 @@ set(BASIC_TESTS
   # pivot_root ... disabled because it fails when run as root and does nothing otherwise
   quotactl
   x86/rdtsc
+  x86/rdtsc_flags
   read_nothing
   readdir
   read_large
@@ -1125,7 +1145,6 @@ set(BASIC_TESTS
   redzone_integrity
   rename
   rlimit
-  robust_futex
   rusage
   samask
   save_data_fd
@@ -1197,6 +1216,7 @@ set(BASIC_TESTS
   simple_threads_stress
   sioc
   small_holes
+  sock_name_null
   sock_names_opts
   spinlock_priorities
   splice
@@ -1264,6 +1284,18 @@ set(BASIC_TESTS
   zero_length_read
 )
 
+if(MQUEUE_H)
+  set(BASIC_TESTS ${BASIC_TESTS} mq)
+endif()
+
+if(FANOTIFY_H)
+  set(BASIC_TESTS ${BASIC_TESTS} fanotify)
+endif()
+
+if(HAVE_ROBUST_MUTEX)
+  set(BASIC_TESTS ${BASIC_TESTS} robust_futex)
+endif()
+
 set(BASIC_CPP_TESTS
   std_random
   unwind_rr_page
@@ -1323,6 +1355,7 @@ set(TESTS_WITH_PROGRAM
   daemon_read
   dconf_mock
   dev_tty
+  x86/diversion_rdtsc
   diversion_sigtrap
   diversion_syscall
   dlopen
@@ -1381,6 +1414,7 @@ set(TESTS_WITH_PROGRAM
   x86/patch_40_80_f6_81
   priority
   ptrace_remote_unmap
+  x86/rdtsc_loop
   read_big_struct
   remove_latest_trace
   restart_abnormal_exit
@@ -1418,7 +1452,9 @@ set(TESTS_WITH_PROGRAM
   x86/string_instructions_replay
   x86/string_instructions_singlestep_fastforward
   x86/string_instructions_watch
+  x86/syscallbuf_branch_check
   syscallbuf_fd_disabling
+  x86/syscallbuf_rdtsc_page
   syscallbuf_signal_blocking_read
   sysconf_onln
   target_fork

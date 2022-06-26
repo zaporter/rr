@@ -296,7 +296,7 @@ function do_ps { psflags=$1
 function debug { expectscript=$1; replayargs=$2
     _RR_TRACE_DIR="$workdir" test-monitor $TIMEOUT debug.err \
         python3 $TESTDIR/$expectscript.py \
-        $RR_EXE $GLOBAL_OPTIONS replay -o-n -x $TESTDIR/test_setup.gdb $replayargs
+        $RR_EXE $GLOBAL_OPTIONS replay -o-n -o-ix -o$TESTDIR/test_setup.gdb $replayargs
     if [[ $? == 0 ]]; then
         passed
     else
@@ -490,5 +490,13 @@ function checkpoint_test { exe=$1; min=$2; max=$3;
         if [[ "$test_passed" != "y" ]]; then
             break
         fi
+    done
+}
+
+function wait_for_complete {
+    local record_dir=${1:-"${workdir}/latest-trace"}
+    for ((i = 0; i < TIMEOUT * 10; i++)); do
+        [[ -f "$record_dir/incomplete" ]] || break
+        sleep 0.1
     done
 }

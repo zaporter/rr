@@ -1097,9 +1097,13 @@ void RecordSession::syscall_state_changed(RecordTask* t,
       debug_exec_state("EXEC_SYSCALL_ENTRY", t);
       ASSERT(t, !t->emulated_stop_pending);
 
+      // Flush syscallbuf now so that anything recorded by
+      // rec_prepare_syscall is associated with the syscall event
+      t->maybe_flush_syscallbuf();
+
       last_task_switchable = t->ev().Syscall().switchable =
           rec_prepare_syscall(t);
-      t->record_event(t->ev(), RecordTask::FLUSH_SYSCALLBUF,
+      t->record_event(t->ev(), RecordTask::DONT_FLUSH_SYSCALLBUF,
                       RecordTask::ALLOW_RESET_SYSCALLBUF,
                       &t->ev().Syscall().regs);
 
@@ -1518,7 +1522,21 @@ bool RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
     case EV_SIGNAL: {
       // This event is used by the replayer to advance to
       // the point of signal delivery.
-      t->record_current_event();
+      if (t->arch() == aarch64 && t->status().is_syscall() &&
+          t->prev_ev() && t->prev_ev()->type() == EV_SYSCALL_INTERRUPTION) {
+        // On aarch64, replaying expects the signal to be delivered before
+        // the syscall instruction but the current pc during recording
+        // is after the syscall instruction with the arg1 clobbered
+        // with the return value (aborted syscall).
+        auto regs = t->regs();
+        auto &syscall_regs = t->prev_ev()->Syscall().regs;
+        regs.set_ip(syscall_regs.ip().decrement_by_syscall_insn_length(t->arch()));
+        regs.set_arg1(syscall_regs.orig_arg1());
+        t->record_event(t->ev(), RecordTask::FLUSH_SYSCALLBUF,
+                        RecordTask::ALLOW_RESET_SYSCALLBUF, &regs);
+      } else {
+        t->record_current_event();
+      }
       t->ev().transform(EV_SIGNAL_DELIVERY);
       ssize_t sigframe_size = 0;
 
@@ -1875,9 +1893,6 @@ bool RecordSession::process_syscall_entry(RecordTask* t, StepState* step_state,
 
   // We just entered a syscall.
   if (!maybe_restart_syscall(t)) {
-    // Emit FLUSH_SYSCALLBUF if necessary before we do any patching work
-    t->maybe_flush_syscallbuf();
-
     if (syscall_seccomp_ordering_ == PTRACE_SYSCALL_BEFORE_SECCOMP_UNKNOWN &&
         t->seccomp_bpf_enabled) {
       // We received a PTRACE_SYSCALL notification before the seccomp

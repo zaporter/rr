@@ -1754,6 +1754,7 @@ static Switchable prepare_ioctl(RecordTask* t,
       return PREVENT_SWITCH;
 
     case BLKSSZGET:
+    case BLKALIGNOFF:
     case KDGKBMODE:
     case RNDGETENTCNT:
     case TIOCINQ:
@@ -1761,6 +1762,28 @@ static Switchable prepare_ioctl(RecordTask* t,
     case TIOCGETD:
     case VT_OPENQRY:
       syscall_state.reg_parameter<int>(3);
+      return PREVENT_SWITCH;
+
+    case BLKROGET:
+    case BLKIOMIN:
+    case BLKIOOPT:
+    case BLKPBSZGET:
+    case BLKDISCARDZEROES:
+      syscall_state.reg_parameter<unsigned int>(3);
+      return PREVENT_SWITCH;
+
+    case BLKGETSIZE:
+      syscall_state.reg_parameter<typename Arch::unsigned_long>(3);
+      return PREVENT_SWITCH;
+
+    case BLKRAGET:
+    case BLKFRAGET:
+      syscall_state.reg_parameter<typename Arch::signed_long>(3);
+      return PREVENT_SWITCH;
+
+    case BLKSECTGET:
+    case BLKROTATIONAL:
+      syscall_state.reg_parameter<typename Arch::unsigned_short>(3);
       return PREVENT_SWITCH;
 
     case TIOCGWINSZ:
@@ -2005,7 +2028,8 @@ static Switchable prepare_ioctl(RecordTask* t,
     case IOCTL_MASK_SIZE(JSIOCGNAME(0)):
     case IOCTL_MASK_SIZE(HIDIOCGRAWINFO):
     case IOCTL_MASK_SIZE(HIDIOCGRAWNAME(0)):
-    case IOCTL_MASK_SIZE(BLKGETSIZE64):
+    case IOCTL_MASK_SIZE(BLKBSZGET):
+    case IOCTL_MASK_SIZE(BLKGETDISKSEQ):
       syscall_state.reg_parameter(3, size);
       return PREVENT_SWITCH;
 
@@ -2019,6 +2043,11 @@ static Switchable prepare_ioctl(RecordTask* t,
     case IOCTL_MASK_SIZE(USBDEVFS_SETINTERFACE):
     case IOCTL_MASK_SIZE(USBDEVFS_SUBMITURB):
       // Doesn't actually seem to write to userspace
+      return PREVENT_SWITCH;
+
+    case IOCTL_MASK_SIZE(BLKGETSIZE64):
+      // The ioctl definition says "size_t" but it's actually a uint64!
+      syscall_state.reg_parameter<uint64_t>(3);
       return PREVENT_SWITCH;
 
     case IOCTL_MASK_SIZE(TUNGETIFF):
@@ -5006,6 +5035,18 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       syscall_state.emulate_result(0);
       return PREVENT_SWITCH;
 
+    // This normally won't be executed but it can be if an RDTSC traps to
+    // the syscallbuf as a fake rrcall_rdtsc, but we then can't buffer it
+    // because the buffer is full or disabled.
+    case SYS_rrcall_rdtsc: {
+      syscall_state.emulate_result(0);
+      uint64_t tsc = rdtsc();
+      remote_ptr<uint64_t> addr(t->regs().arg1());
+      t->write_mem(addr, tsc);
+      t->record_local(addr, &tsc);
+      return PREVENT_SWITCH;
+    }
+
     case SYS_rrcall_init_buffers:
       // This is purely for testing purposes. See signal_during_preload_init.
       if (send_signal_during_init_buffers()) {
@@ -5382,17 +5423,21 @@ static uint64_t word_at(uint8_t* buf, size_t wsize) {
   return u.v;
 }
 
-static remote_ptr<void> get_exe_entry(Task* t) {
+static pair<remote_ptr<void>, remote_ptr<void>> get_exe_entry_interp_base(Task* t) {
+  remote_ptr<void> exe_entry;
+  remote_ptr<void> interp_base;
   vector<uint8_t> v = read_auxv(t);
   size_t i = 0;
   size_t wsize = word_size(t->arch());
   while ((i + 1)*wsize*2 <= v.size()) {
     if (word_at(v.data() + i*2*wsize, wsize) == AT_ENTRY) {
-      return word_at(v.data() + (i*2 + 1)*wsize, wsize);
+      exe_entry = word_at(v.data() + (i*2 + 1)*wsize, wsize);
+    } else if (word_at(v.data() + i*2*wsize, wsize) == AT_BASE) {
+      interp_base = word_at(v.data() + (i*2 + 1)*wsize, wsize);
     }
     ++i;
   }
-  return remote_ptr<void>();
+  return make_pair(exe_entry, interp_base);
 }
 
 /**
@@ -5428,6 +5473,7 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
     return;
   }
 
+  string interp_name;
   {
     std::string exe_path = t->proc_exe_path();
     ScopedFd fd(exe_path.c_str(), O_RDONLY);
@@ -5440,6 +5486,9 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
       FATAL() << "rr does not support the x32 ABI, but " << t->exe_path()
               << " is an x32 ABI program.";
     }
+
+    ElfFileReader reader(fd);
+    interp_name = reader.read_interp();
   }
 
   t->post_exec_syscall();
@@ -5472,8 +5521,11 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
 
   // get the remote executable entry point
   // with the pointer, we find out which mapping is the executable
-  auto exe_entry = get_exe_entry(t);
+  auto auxv_pointers = get_exe_entry_interp_base(t);
+  auto exe_entry = auxv_pointers.first;
+  auto interp_base = auxv_pointers.second;
   ASSERT(t, !exe_entry.is_null()) << "AT_ENTRY not found";
+  // NB: A binary is not required to have an interpreter.
 
   // Write out stack mappings first since during replay we need to set up the
   // stack before any files get mapped.
@@ -5492,6 +5544,12 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
     if (km.start() <= exe_entry && exe_entry < km.end()) {
       ASSERT(t, km.prot() & PROT_EXEC) << "Entry point not in executable code?";
       syscall_state.exec_saved_event->set_exe_base(km.start());
+    }
+    if (km.start() == interp_base) {
+      t->vm()->set_interp_base(interp_base);
+      syscall_state.exec_saved_event->set_interp_base(interp_base);
+      t->vm()->set_interp_name(interp_name);
+      syscall_state.exec_saved_event->set_interp_name(interp_name);
     }
   }
   ASSERT(t, !syscall_state.exec_saved_event->exe_base().is_null());

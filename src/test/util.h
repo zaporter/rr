@@ -52,7 +52,9 @@
 #include <linux/videodev2.h>
 #include <linux/vt.h>
 #include <linux/wireless.h>
+#ifdef MQUEUE_H
 #include <mqueue.h>
+#endif
 #include <poll.h>
 #include <pthread.h>
 #include <pty.h>
@@ -69,7 +71,9 @@
 #include <sys/auxv.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#ifdef FANOTIFY_H
 #include <sys/fanotify.h>
+#endif
 #include <sys/file.h>
 #include <sys/fsuid.h>
 #include <sys/inotify.h>
@@ -112,7 +116,6 @@
 // X86 specific headers
 #if defined(__i386__) || defined(__x86_64__)
 #include <asm/prctl.h>
-#include <sys/io.h>
 #include <x86intrin.h>
 #endif
 
@@ -480,6 +483,10 @@ inline static SyscallWrapper get_spurious_desched_syscall(void) {
 #endif
 #ifndef PR_SET_VMA_ANON_NAME
 #define PR_SET_VMA_ANON_NAME 0
+#endif
+
+#ifndef BLKGETDISKSEQ
+#define BLKGETDISKSEQ _IOR(0x12,128,__u64)
 #endif
 
 #endif /* RRUTIL_H */

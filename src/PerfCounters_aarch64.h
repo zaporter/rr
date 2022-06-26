@@ -35,15 +35,43 @@ static CpuMicroarch compute_cpu_microarch(const CPUID &cpuid) {
   switch (cpuid.implementer) {
   case 0x41: // ARM
     switch (cpuid.part) {
+    case 0xd05:
+      return ARMCortexA55;
+    case 0xd0a:
+      return ARMCortexA75;
+    case 0xd0b:
+      return ARMCortexA76;
     case 0xd0c:
       return ARMNeoverseN1;
+    case 0xd0d:
+      return ARMCortexA77;
+    case 0xd41:
+      return ARMCortexA78;
+    case 0xd44:
+      return ARMCortexX1;
+    case 0xd4a:
+      return ARMNeoverseE1;
+    }
+    break;
+  case 0x51: // Qualcomm
+    switch (cpuid.part) {
+    case 0x802:
+      return ARMCortexA75;
+    case 0x803:
+      return ARMCortexA55;
+    case 0x804:
+      return ARMCortexA76;
+    case 0x805:
+      return ARMCortexA55;
     }
     break;
   case 0x61: // Apple
     switch (cpuid.part) {
     case 0x22:
+    case 0x24:
       return AppleM1Icestorm;
     case 0x23:
+    case 0x25:
       return AppleM1Firestorm;
     }
     break;
@@ -271,8 +299,13 @@ static void post_init_pmu_uarchs(std::vector<PmuConfig> &pmu_uarchs)
       pmu_uarch.event_type = type;
     }
   };
+  bool has_unknown = false;
   for (size_t i = 0; i < npmus; i++) {
     auto &pmu_uarch = pmu_uarchs[i];
+    if (!(pmu_uarch.flags & (PMU_TICKS_RCB | PMU_TICKS_TAKEN_BRANCHES))) {
+      has_unknown = true;
+      continue;
+    }
     if (!pmu_uarch.pmu_name) {
       CLEAN_FATAL() << "Unknown PMU name for core " << i;
       continue;
@@ -313,10 +346,28 @@ static void post_init_pmu_uarchs(std::vector<PmuConfig> &pmu_uarchs)
       pmu_type = val;
     }
   }
-  if (pmu_types.size() == 1) {
-    // Single PMU type
-    pmu_uarchs.resize(1);
-  } else if (pmu_type_failed) {
+  if (pmu_types.size() == 1 && !has_unknown) {
+    bool single_type = true;
+    auto &pmu_uarch0 = pmu_uarchs[0];
+    // Apparently the same PMU type doesn't actually mean the same PMU events...
+    for (auto &pmu_uarch: pmu_uarchs) {
+      if (&pmu_uarch == &pmu_uarch0) {
+        // Skip first
+        continue;
+      }
+      if (pmu_uarch.rcb_cntr_event != pmu_uarch0.rcb_cntr_event ||
+          pmu_uarch.minus_ticks_cntr_event != pmu_uarch0.minus_ticks_cntr_event ||
+          pmu_uarch.llsc_cntr_event != pmu_uarch0.llsc_cntr_event) {
+        single_type = false;
+        break;
+      }
+    }
+    if (single_type) {
+      // Single PMU type
+      pmu_uarchs.resize(1);
+    }
+  }
+  if (pmu_uarchs.size() != 1 && pmu_type_failed) {
     // If reading PMU type failed, we only allow a single PMU type to be sure
     // that we get what we want from the kernel events.
     CLEAN_FATAL() << "Unable to read PMU event types";

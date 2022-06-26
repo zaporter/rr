@@ -815,7 +815,7 @@ void Task::move_ip_before_breakpoint() {
   set_regs(r);
 }
 
-void Task::enter_syscall() {
+bool Task::enter_syscall(bool allow_exit) {
   bool need_ptrace_syscall_event = !seccomp_bpf_enabled ||
                                    session().syscall_seccomp_ordering() ==
                                        Session::SECCOMP_BEFORE_PTRACE_SYSCALL;
@@ -827,6 +827,9 @@ void Task::enter_syscall() {
       ASSERT(this, need_seccomp_event);
       need_seccomp_event = false;
       continue;
+    }
+    if (allow_exit && ptrace_event() == PTRACE_EVENT_EXIT) {
+      return false;
     }
     ASSERT(this, !ptrace_event());
     if (session().is_recording() && wait_status.group_stop()) {
@@ -851,6 +854,7 @@ void Task::enter_syscall() {
   }
   apply_syscall_entry_regs();
   canonicalize_regs(arch());
+  return true;
 }
 
 bool Task::exit_syscall() {
@@ -2223,6 +2227,9 @@ static void setup_preload_thread_locals_from_clone_arch(Task* t, Task* origin) {
     auto origin_locals = reinterpret_cast<const preload_thread_locals<Arch>*>(
         origin->fetch_preload_thread_locals());
     locals->alt_stack_nesting_level = origin_locals->alt_stack_nesting_level;
+    // vfork() will restore the flags on the way out since its on the same
+    // stack.
+    locals->saved_flags = origin_locals->saved_flags;
     // clone() syscalls set the child stack pointer, so the child is no
     // longer in the syscallbuf code even if the parent was.
   }
@@ -3934,6 +3941,12 @@ void Task::move_to_signal_stop()
    * don't want it delivered to the task for real.
    */
   auto old_ip = ip();
+  if (arch() == aarch64 && session().is_recording() && status().is_syscall() &&
+      static_cast<RecordTask*>(this)->at_may_restart_syscall()) {
+    // On aarch64, single step of an aborted syscall
+    // will cause us to move to before the syscall instruction
+    old_ip = old_ip.decrement_by_syscall_insn_length(arch());
+  }
   do {
     resume_execution(RESUME_SINGLESTEP, RESUME_WAIT, RESUME_NO_TICKS);
     ASSERT(this, old_ip == ip())

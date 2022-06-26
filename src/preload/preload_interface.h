@@ -307,11 +307,9 @@ struct preload_thread_locals {
   /* The offset of this field MUST NOT CHANGE, it is part of the preload ABI
    * rr depends on.
    */
-  int alt_stack_nesting_level;
-  /**
-   * We could use this later.
-   */
-  int unused_padding;
+  int32_t alt_stack_nesting_level;
+  /* Syscall hook saved flags (bottom 16 bits only) */
+  int32_t saved_flags;
   /* The offset of this field MUST NOT CHANGE, it is part of the preload ABI
    * rr depends on. It contains the parameters to the patched syscall, or
    * zero if we're not processing a buffered syscall. Do not depend on this
@@ -394,6 +392,8 @@ enum syscallbuf_fd_classes {
 /**
  * Packs up the parameters passed to |SYS_rrcall_init_preload|.
  * We use this struct because it's a little cleaner.
+ * When evolving this struct, add new fields at the end and don't
+ * depend on them during replay.
  */
 TEMPLATE_ARCH
 struct rrcall_init_preload_params {

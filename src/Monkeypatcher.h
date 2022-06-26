@@ -63,6 +63,20 @@ public:
    * be replayed.
    */
   bool try_patch_syscall(RecordTask* t, bool entering_syscall = true);
+  bool try_patch_syscall_x86ish(RecordTask* t, bool entering_syscall,
+                                SupportedArch arch);
+  bool try_patch_syscall_aarch64(RecordTask* t, bool entering_syscall);
+
+  /**
+   * Try to patch the trapping instruction that |t| just trapped on. If this
+   * returns false, patching failed and the instruction should be processed
+   * as normal. If this returns true, patching succeeded.
+   * t->ip() is the address of the trapping instruction.
+   * and execution should resume normally to execute the patched code.
+   * Zero or more mapping operations are also recorded to the trace and must
+   * be replayed.
+   */
+  bool try_patch_trapping_instruction(RecordTask* t, size_t instruction_length);
 
   /**
    * Replace all extended jumps by syscalls again. Note that we do not try to
@@ -127,14 +141,23 @@ public:
 
 private:
   /**
+   * `ip` is the address of the instruction that triggered the syscall or trap
+   */
+  const syscall_patch_hook* find_syscall_hook(RecordTask* t,
+                                              remote_code_ptr ip,
+                                              bool allow_deferred_patching,
+                                              bool entering_syscall,
+                                              size_t instruction_length);
+
+  /**
    * The list of supported syscall patches obtained from the preload
    * library. Each one matches a specific byte signature for the instruction(s)
    * after a syscall instruction.
    */
   std::vector<syscall_patch_hook> syscall_hooks;
   /**
-   * The addresses of the instructions following syscalls that we've tried
-   * (or are currently trying) to patch.
+   * The addresses of the instructions following syscalls or other
+   * instructions that we've tried (or are currently trying) to patch.
    */
   std::unordered_set<remote_code_ptr> tried_to_patch_syscall_addresses;
 };

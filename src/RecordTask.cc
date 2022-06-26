@@ -1224,6 +1224,10 @@ sig_set_t RecordTask::read_sigmask_from_process() {
   }
 
   auto results = read_proc_status_fields(tid, "SigBlk");
+  if (results.empty()) {
+    // Read failed, process probably died
+    return 0;
+  }
   ASSERT(this, results.size() == 1);
   return strtoull(results[0].c_str(), NULL, 16);
 }
@@ -1294,6 +1298,10 @@ void RecordTask::verify_signal_states() {
   }
 
   auto results = read_proc_status_fields(tid, "SigBlk", "SigIgn", "SigCgt");
+  if (results.empty()) {
+    // Read failed, process probably died
+    return;
+  }
   ASSERT(this, results.size() == 3);
   sig_set_t blocked = strtoull(results[0].c_str(), NULL, 16);
   sig_set_t ignored = strtoull(results[1].c_str(), NULL, 16);
@@ -1477,7 +1485,7 @@ bool RecordTask::is_syscall_restart() {
 
   {
     const Registers& old_regs = ev().Syscall().regs;
-    if (!(old_regs.arg1() == regs().arg1() &&
+    if (!(old_regs.orig_arg1() == regs().arg1() &&
           old_regs.arg2() == regs().arg2() &&
           old_regs.arg3() == regs().arg3() &&
           old_regs.arg4() == regs().arg4() &&
@@ -1874,7 +1882,6 @@ void RecordTask::record_event(const Event& ev, FlushSyscallbuf flush,
   }
 
   if (!ev.has_ticks_slop() && reset == ALLOW_RESET_SYSCALLBUF) {
-    ASSERT(this, flush == FLUSH_SYSCALLBUF);
     // After we've output an event, it's safe to reset the syscallbuf (if not
     // explicitly delayed) since we will have exited the syscallbuf code that
     // consumed the syscallbuf data.

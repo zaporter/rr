@@ -11,6 +11,50 @@
         .hidden _syscallbuf_final_exit_instruction
         .type _syscallbuf_final_exit_instruction, @function
 
+#define DW_OP_CONST4U(val)                      \
+        0x0c, /* DW_OP_const4u */               \
+        /* Individually place bytes */          \
+        (val) & 0xFF,                           \
+        ((val) & (0xFF <<  0x8)) >>  0x8,       \
+        ((val) & (0xFF << 0x10)) >> 0x10,       \
+        ((val) & (0xFF << 0x18)) >> 0x18
+
+#define DW_OP_CONST8U(val)                      \
+        0x0e, /* DW_OP_const8u */               \
+        /* Individually place bytes */          \
+        (val) & 0xFF,                           \
+        ((val) & (0xFF <<  0x8)) >>  0x8,       \
+        ((val) & (0xFF << 0x10)) >> 0x10,       \
+        ((val) & (0xFF << 0x18)) >> 0x18,       \
+        ((val) & (0xFF << 0x20)) >> 0x20,       \
+        ((val) & (0xFF << 0x28)) >> 0x28,       \
+        ((val) & (0xFF << 0x30)) >> 0x30,       \
+        ((val) & (0xFF << 0x38)) >> 0x38
+
+#define REG_AT_ADDR32(reg, addr)                                \
+        .cfi_escape 0x10, /* DW_CFA_expression */               \
+                    reg,                                        \
+                    0x05, /* 5 byte expression follows */       \
+                    DW_OP_CONST4U(addr)
+#define REG_AT_ADDR64(reg, addr)                                \
+        .cfi_escape 0x10, /* DW_CFA_expression */               \
+                    reg,                                        \
+                    0x09, /* 9 byte expression follows */       \
+                    DW_OP_CONST8U(addr)
+
+// 10 bytes LEB128 is enough to encode 64bit integer and we shouldn't
+// really need anything longer than that.
+#define COUNT_LEB128(lebs...)                                   \
+        _COUNT_LEB128(lebs, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1)
+#define _COUNT_LEB128(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, N, ...) N
+
+#define REG_AT_REG_OFFSET(reg, base, lebs...)                                   \
+        .cfi_escape 0x10, /* DW_CFA_expression */                               \
+                    reg,                                                        \
+                    (COUNT_LEB128(lebs) + 1), /* 1 byte + LEB128 bytes */       \
+                    (0x70 + base), /* DW_OP_breg0 + base */                     \
+                    lebs
+
 #if defined(__i386__)
 /**
  * Jump to this hook from |__kernel_vsyscall()|, to buffer syscalls that
@@ -30,6 +74,7 @@
         .set syscallbuf_stub_alt_stack, preload_thread_locals
         .set stub_scratch_1, preload_thread_locals + 8
         .set alt_stack_nesting_level, preload_thread_locals + 12
+        .set saved_flags, preload_thread_locals + 16
 
         .p2align 4
 _syscallbuf_code_start:
@@ -77,8 +122,14 @@ _switch_stack_vsyscall:
 
         /* Pop previous EIP */
         lea 4(%esp),%esp
-        /* Restore previous ESP */
-        subl $4,(%esp)
+
+        /* Restore previous ESP ... without modifying flags */
+        mov %eax,(stub_scratch_1)
+        mov (%esp),%eax
+        lea -4(%eax),%eax
+        mov %eax,(%esp)
+        mov (stub_scratch_1),%eax
+
         pop %esp
         ret
         .cfi_endproc
@@ -152,13 +203,17 @@ _syscall_hook_trampoline:
         movdqa 0x70(%esp),%xmm6
         movdqa 0x80(%esp),%xmm7
 
+        mov $saved_flags, %esp
+        popfw
+        /* From here on, non-application flag changes are not allowed */
+
         /* Restore ESP */
         mov %ebp, %esp
         .cfi_def_cfa_register %esp
 
         /* $eax is now the syscall return value.  Erase |info.no| from the
          * stack so that we can restore the other registers we saved. */
-        addl $4,%esp
+        lea 4(%esp),%esp
         .cfi_adjust_cfa_offset -4
 
         /* Contract of __kernel_vsyscall() and real syscalls is that even
@@ -205,15 +260,7 @@ name:                           \
         .cfi_adjust_cfa_offset -4;                              \
         pop %esp;                                               \
         .cfi_same_value %esp;                                   \
-        .cfi_escape 0x10, /* DW_CFA_expression */               \
-                    0x08, /* %eip */                            \
-                    0x05, /* 5 byte expression follows */       \
-                    0x0c, /* DW_OP_const4u */                   \
-                    /* Individually place bytes */              \
-                    stub_scratch_1 & 0xFF,                      \
-                    (stub_scratch_1 & (0xFF <<  0x8)) >>  0x8,  \
-                    (stub_scratch_1 & (0xFF << 0x10)) >> 0x10,  \
-                    (stub_scratch_1 & (0xFF << 0x18)) >> 0x18;  \
+        REG_AT_ADDR32(0x08 /* %eip */, stub_scratch_1);         \
         jmp _syscallbuf_final_exit_instruction;                 \
        .cfi_endproc;                                            \
        .size name, .-name
@@ -261,6 +308,7 @@ _get_pc_thunks_end:
 
         .set stub_scratch_1, preload_thread_locals + 16
         .set alt_stack_nesting_level, preload_thread_locals + 24
+        .set saved_flags, preload_thread_locals + 28
 
         .p2align 4
 _syscallbuf_code_start:
@@ -312,9 +360,18 @@ _syscall_hook_trampoline:
         movdqa %xmm6,0x60(%rsp)
         movdqa %xmm7,0x70(%rsp)
 
+        /* Save registers that aren't callee-saves preserved by syscall_hook,
+           and that we aren't already restoring from the syscall args */
+        push %rcx
+        push %r11
+        /* stack is 16-byte aligned again for entry to C */
+
         /* Call our hook. */
         mov %rbx,%rdi
         callq syscall_hook
+
+        pop %r11
+        pop %rcx
 
         /* Restore XMM registers */
         movdqa (%rsp),%xmm0
@@ -326,13 +383,16 @@ _syscall_hook_trampoline:
         movdqa 0x60(%rsp),%xmm6
         movdqa 0x70(%rsp),%xmm7
 
+        mov $saved_flags, %rsp
+        popfw
+        /* From here on, non-application flag changes are not allowed */
+
         mov %rbx,%rsp
         .cfi_def_cfa_register %rsp
 
         /* On entrance, we pushed the %rax, the syscall number. But we don't
-           want to |pop %rax|, as that will overwrite our return value. Pop
-           into %r11 instead. */
-        pop %r11
+           want to |pop %rax|, as that will overwrite our return value. Skip over it. */
+        pop %rdi
         .cfi_adjust_cfa_offset -8
 
         /* We don't really *need* to restore these, since the kernel could have
@@ -408,11 +468,7 @@ _syscallbuf_final_exit_instruction:
             0x02, /* 2 bytes follow */\
             0x77, offset; /* DW_OP_breg7, offset */
 
-#define RIP_IS_DEREF_RSP(offset) \
-.cfi_escape 0x10, /* DW_CFA_expression */\
-            0x10, /* %rip */\
-            0x02, /* 2 bytes follow */\
-            0x77, offset; /* DW_OP_breg7, 0 */
+#define RIP_IS_DEREF_RSP(offset) REG_AT_REG_OFFSET(0x10 /* %rip */, 7, offset)
 
 /**
  * On syscallhook entry, the stack has been switched to the end of per-task
@@ -431,19 +487,7 @@ name:                              \
 #define SYSCALLHOOK_END(name)                                   \
         pop (stub_scratch_1);                                   \
         CFA_AT_RSP_OFFSET(0)                                    \
-        .cfi_escape 0x10, /* DW_CFA_expression */               \
-                    0x10, /* %rip */                            \
-                    0x09, /* 9 byte expression follows */       \
-                    0x0e, /* DW_OP_const8u */                   \
-                    /* Individually place bytes */              \
-                    stub_scratch_1 & 0xFF,                      \
-                    (stub_scratch_1 & (0xFF <<  0x8)) >>  0x8,  \
-                    (stub_scratch_1 & (0xFF << 0x10)) >> 0x10,  \
-                    (stub_scratch_1 & (0xFF << 0x18)) >> 0x18,  \
-                    (stub_scratch_1 & (0xFF << 0x20)) >> 0x20,  \
-                    (stub_scratch_1 & (0xFF << 0x28)) >> 0x28,  \
-                    (stub_scratch_1 & (0xFF << 0x30)) >> 0x30,  \
-                    (stub_scratch_1 & (0xFF << 0x38)) >> 0x38;  \
+        REG_AT_ADDR32(0x10 /* %rip */, stub_scratch_1);         \
         pop %rsp;                                               \
         .cfi_def_cfa %rsp, 0;                                   \
         jmp _syscallbuf_final_exit_instruction;                 \
@@ -571,6 +615,62 @@ SYSCALLHOOK_START(_syscall_hook_trampoline_49_89_ca)
 	mov %rcx, %r10
 	call __morestack
 SYSCALLHOOK_END(_syscall_hook_trampoline_49_89_ca)
+
+SYSCALLHOOK_START(_syscall_hook_trampoline_48_89_c1)
+        callq __morestack
+        mov %rax, %rcx
+SYSCALLHOOK_END(_syscall_hook_trampoline_48_89_c1)
+
+#define MOV_RDX_VARIANTS \
+  MOV_RDX_TO_REG(48, d0) \
+  MOV_RDX_TO_REG(48, d1) \
+  MOV_RDX_TO_REG(48, d2) \
+  MOV_RDX_TO_REG(48, d3) \
+  MOV_RDX_TO_REG(48, d4) \
+  MOV_RDX_TO_REG(48, d5) \
+  MOV_RDX_TO_REG(48, d6) \
+  MOV_RDX_TO_REG(48, d7) \
+  MOV_RDX_TO_REG(49, d0) \
+  MOV_RDX_TO_REG(49, d1) \
+  MOV_RDX_TO_REG(49, d2) \
+  MOV_RDX_TO_REG(49, d3) \
+  MOV_RDX_TO_REG(49, d4) \
+  MOV_RDX_TO_REG(49, d5) \
+  MOV_RDX_TO_REG(49, d6) \
+  MOV_RDX_TO_REG(49, d7)
+
+#define MOV_RDX_TO_REG(rex, op) \
+SYSCALLHOOK_START(_syscall_hook_trampoline_##rex##_89_##op); \
+        callq __morestack;                                   \
+        .byte 0x##rex, 0x89, 0x##op;                         \
+SYSCALLHOOK_END(_syscall_hook_trampoline_##rex##_89_##op);
+
+  MOV_RDX_VARIANTS
+
+SYSCALLHOOK_START(_syscall_hook_trampoline_48_c1_e2_20)
+        callq __morestack
+        shl $32, %rdx
+SYSCALLHOOK_END(_syscall_hook_trampoline_48_c1_e2_20)
+
+SYSCALLHOOK_START(_syscall_hook_trampoline_4c_89_f7)
+        mov %r14, %rdi
+        callq __morestack
+SYSCALLHOOK_END(_syscall_hook_trampoline_4c_89_f7)
+
+SYSCALLHOOK_START(_syscall_hook_trampoline_4c_89_ff)
+        mov %r15, %rdi
+        callq __morestack
+SYSCALLHOOK_END(_syscall_hook_trampoline_4c_89_ff)
+
+SYSCALLHOOK_START(_syscall_hook_trampoline_49_c7_c1_ff_ff_ff_ff)
+        mov $0xffffffffffffffff,%r9
+        callq __morestack
+SYSCALLHOOK_END(_syscall_hook_trampoline_49_c7_c1_ff_ff_ff_ff)
+
+SYSCALLHOOK_START(_syscall_hook_trampoline_b8_ca_00_00_00)
+        mov $0xca,%eax
+        callq __morestack
+SYSCALLHOOK_END(_syscall_hook_trampoline_b8_ca_00_00_00)
 
 #endif /* __x86_64__ */
 

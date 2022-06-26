@@ -440,7 +440,9 @@ void TraceWriter::write_frame(RecordTask* t, const Event& ev,
       event.setInstructionTrap(Void());
       break;
     case EV_PATCH_SYSCALL:
-      if (ev.PatchSyscall().patch_vsyscall) {
+      if (ev.PatchSyscall().patch_trapping_instruction) {
+        event.setPatchTrappingInstruction(Void());
+      } else if (ev.PatchSyscall().patch_vsyscall) {
         event.setPatchVsyscall(Void());
       } else if (ev.PatchSyscall().patch_after_syscall) {
         event.setPatchAfterSyscall(Void());
@@ -603,6 +605,10 @@ TraceFrame TraceReader::read_frame() {
     case trace::Frame::Event::PATCH_SYSCALL:
       ret.ev = Event::patch_syscall();
       break;
+    case trace::Frame::Event::PATCH_TRAPPING_INSTRUCTION:
+      ret.ev = Event::patch_syscall();
+      ret.ev.PatchSyscall().patch_trapping_instruction = true;
+      break;
     case trace::Frame::Event::PATCH_VSYSCALL:
       ret.ev = Event::patch_syscall();
       ret.ev.PatchSyscall().patch_vsyscall = true;
@@ -736,6 +742,8 @@ void TraceWriter::write_task_event(const TraceTaskEvent& event) {
         cmd_line.set(i, str_to_data(event_cmd_line[i]));
       }
       exec.setExeBase(event.exe_base().as_int());
+      exec.setInterpBase(event.interp_base().as_int());
+      exec.setInterpName(str_to_data(event.interp_name()));;
       break;
     }
     case TraceTaskEvent::EXIT:
@@ -796,6 +804,8 @@ TraceTaskEvent TraceReader::read_task_event(FrameTime* time) {
         r.cmd_line_[i] = data_to_str(cmd_line[i]);
       }
       r.exe_base_ = exec.getExeBase();
+      r.interp_base_ = exec.getInterpBase();
+      r.interp_name_ = data_to_str(exec.getInterpName());
       break;
     }
     case trace::TaskEvent::Which::EXIT:
@@ -1276,8 +1286,9 @@ static string make_trace_dir(const string& exe_path, const string& output_trace_
       return output_trace_dir;
     }
     if (EEXIST == errno) {
-      // directory already exists
-      FATAL() << "Directory `" << output_trace_dir << "' already exists.";
+      CLEAN_FATAL() << "Trace directory `" << output_trace_dir << "' already exists.";
+    } else if (EACCES == errno) {
+      CLEAN_FATAL() << "Permission denied to create trace directory `" << output_trace_dir << "'";
     } else {
       FATAL() << "Unable to create trace directory `" << output_trace_dir << "'";
     }

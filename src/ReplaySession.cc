@@ -509,7 +509,7 @@ Completion ReplaySession::cont_syscall_boundary(
       break;
   }
   if (t->stop_sig()) {
-      ASSERT(t, false) << "Replay got unrecorded signal " << t->get_siginfo();
+    ASSERT(t, false) << "Replay got unrecorded signal " << t->get_siginfo();
   }
 
   if (t->seccomp_bpf_enabled &&
@@ -524,6 +524,8 @@ Completion ReplaySession::cont_syscall_boundary(
     t->resume_execution(RESUME_SYSEMU, RESUME_WAIT, ticks_request);
   }
 
+  t->apply_syscall_entry_regs();
+
   auto type = AddressSpace::rr_page_syscall_from_exit_point(t->arch(), t->ip());
   if (type && type->traced == AddressSpace::UNTRACED &&
       type->enabled == AddressSpace::REPLAY_ONLY) {
@@ -533,7 +535,6 @@ Completion ReplaySession::cont_syscall_boundary(
     return INCOMPLETE;
   }
 
-  t->apply_syscall_entry_regs();
   return COMPLETE;
 }
 
@@ -611,9 +612,16 @@ Completion ReplaySession::enter_syscall(ReplayTask* t,
     if (cont_syscall_boundary(t, constraints) == INCOMPLETE) {
       bool reached_target = syscall_bp_vm && SIGTRAP == t->stop_sig() &&
                             t->ip().undo_executed_bkpt(t->arch()) ==
-                                syscall_instruction &&
-                            t->vm()->get_breakpoint_type_at_addr(
-                                syscall_instruction) == BKPT_INTERNAL;
+                                syscall_instruction;
+      if (reached_target) {
+        // Check if we've hit a user break/watchpoint
+        if (t->vm()->get_breakpoint_type_at_addr(syscall_instruction) != BKPT_INTERNAL) {
+          reached_target = false;
+        }
+        else if (t->vm()->is_exec_watchpoint(syscall_instruction)) {
+          reached_target = false;
+        }
+      }
       if (reached_target) {
         emulate_syscall_entry(t, current_trace_frame(), syscall_instruction);
         clear_syscall_bp();
@@ -739,6 +747,7 @@ Completion ReplaySession::continue_or_step(ReplayTask* t,
         // would make it harder to track down bugs. There is a performance hit
         // to stopping for each mprotect, but replaying recordings of replays
         // is not fast anyway.)
+        t->apply_syscall_entry_regs();
         perform_interrupted_syscall(t);
         return INCOMPLETE;
       }
@@ -1411,7 +1420,7 @@ Completion ReplaySession::flush_syscallbuf(ReplayTask* t,
   return COMPLETE;
 }
 
-Completion ReplaySession::patch_vsyscall(ReplayTask* t, const StepConstraints& constraints)
+Completion ReplaySession::patch_ip(ReplayTask* t, const StepConstraints& constraints)
 {
   TicksRequest ticks_request;
   if (!compute_ticks_request(t, constraints, &ticks_request)) {
@@ -1444,24 +1453,14 @@ Completion ReplaySession::patch_vsyscall(ReplayTask* t, const StepConstraints& c
     return INCOMPLETE;
   }
 
-  t->apply_all_data_records_from_trace();
+  apply_patch_data(t);
   Registers r = t->regs();
   r.set_ip(vsyscall_entry);
   t->set_regs(r);
   return COMPLETE;
 }
 
-Completion ReplaySession::patch_next_syscall(
-    ReplayTask* t, const StepConstraints& constraints, bool before_syscall) {
-  if (before_syscall) {
-    if (cont_syscall_boundary(t, constraints) == INCOMPLETE) {
-      return INCOMPLETE;
-    }
-
-    t->canonicalize_regs(t->arch());
-    t->exit_syscall_and_prepare_restart();
-  }
-
+void ReplaySession::apply_patch_data(ReplayTask* t) {
   // All patching effects have been recorded to the trace.
   // First, replay any memory mapping done by Monkeypatcher. There should be
   // at most one but we might as well be general.
@@ -1485,6 +1484,19 @@ Completion ReplaySession::patch_next_syscall(
 
   // Now replay all data records.
   t->apply_all_data_records_from_trace();
+}
+
+Completion ReplaySession::patch_next_syscall(
+    ReplayTask* t, const StepConstraints& constraints, bool before_syscall) {
+  if (before_syscall) {
+    if (cont_syscall_boundary(t, constraints) == INCOMPLETE) {
+      return INCOMPLETE;
+    }
+
+    t->canonicalize_regs(t->arch());
+    t->exit_syscall_and_prepare_restart();
+  }
+  apply_patch_data(t);
   return COMPLETE;
 }
 
@@ -1576,8 +1588,8 @@ Completion ReplaySession::try_one_trace_step(
       return emulate_signal_delivery(t, current_step.target.signo);
     case TSTEP_FLUSH_SYSCALLBUF:
       return flush_syscallbuf(t, constraints);
-    case TSTEP_PATCH_VSYSCALL:
-      return patch_vsyscall(t, constraints);
+    case TSTEP_PATCH_IP:
+      return patch_ip(t, constraints);
     case TSTEP_PATCH_SYSCALL:
       return patch_next_syscall(t, constraints, true);
     case TSTEP_PATCH_AFTER_SYSCALL:
@@ -1725,8 +1737,9 @@ ReplayTask* ReplaySession::setup_replay_one_trace_frame(ReplayTask* t) {
       current_step.action = TSTEP_RETIRE;
       break;
     case EV_PATCH_SYSCALL:
-      if (ev.PatchSyscall().patch_vsyscall) {
-        current_step.action = TSTEP_PATCH_VSYSCALL;
+      if (ev.PatchSyscall().patch_trapping_instruction ||
+          ev.PatchSyscall().patch_vsyscall) {
+        current_step.action = TSTEP_PATCH_IP;
       } else if (ev.PatchSyscall().patch_after_syscall) {
         current_step.action = TSTEP_PATCH_AFTER_SYSCALL;
       } else {
