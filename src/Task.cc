@@ -76,6 +76,9 @@ Task::Task(Session& session, pid_t _tid, pid_t _rec_tid, uint32_t serial,
       rec_tid(_rec_tid > 0 ? _rec_tid : _tid),
       own_namespace_rec_tid(_rec_tid > 0 ? _rec_tid: _tid),
       syscallbuf_size(0),
+      ticks_at_last_syscall_entry(0),
+      ip_at_last_syscall_entry(nullptr),
+      last_syscall_entry_recorded(false),
       serial(serial),
       prname("???"),
       ticks(0),
@@ -1295,11 +1298,43 @@ void Task::setup_preload_thread_locals() {
   RR_ARCH_FUNCTION(setup_preload_thread_locals_arch, arch(), this);
 }
 
-const Task::ThreadLocals& Task::fetch_preload_thread_locals() {
+#ifdef __aarch64__
+static_assert(offsetof(preload_thread_locals<rr::ARM64Arch>, stub_scratch_2) +
+              PRELOAD_THREAD_LOCAL_SCRATCH2_SIZE ==
+              sizeof(preload_thread_locals<rr::ARM64Arch>),
+              "stub_scratch_2 not the last member");
+static bool need_fetch_full(Task *t) {
+  // We only need to fetch the full size if x8 is pointing within
+  // [PRELOAD_THREAD_LOCALS_ADDR,
+  //  PRELOAD_THREAD_LOCALS_ADDR + PRELOAD_THREAD_LOCAL_SCRATCH2_SIZE - 16]
+  // We also don't need to fetch when we are in a syscall stop but when that's
+  // the case we should almost always trivially have an x8 outside this range.
+  // We could also check if it's in syscallbuf code range
+  // but the lookup of the stub address would probably be too expensive to worth it...
+  auto x8 = t->regs().syscallno();
+  return x8 >= PRELOAD_THREAD_LOCALS_ADDR &&
+    x8 <= PRELOAD_THREAD_LOCALS_ADDR + PRELOAD_THREAD_LOCAL_SCRATCH2_SIZE - 16;
+}
+// Always copy the first two pointers in stub_scratch_2 since those are used
+// past the entry of the syscallbuf.
+static size_t preload_thread_locals_size(bool full) {
+  return full ? PRELOAD_THREAD_LOCALS_SIZE :
+    (offsetof(preload_thread_locals<rr::ARM64Arch>, stub_scratch_2) + 16);
+}
+#else
+static bool need_fetch_full(Task*) {
+  return true;
+}
+static size_t preload_thread_locals_size(bool) {
+  return PRELOAD_THREAD_LOCALS_SIZE;
+}
+#endif
+
+const Task::ThreadLocals& Task::fetch_preload_thread_locals(bool fetch_full) {
   if (tuid() == as->thread_locals_tuid()) {
     void* local_addr = preload_thread_locals_local_addr(*as);
     if (local_addr) {
-      memcpy(thread_locals, local_addr, PRELOAD_THREAD_LOCALS_SIZE);
+      memcpy(thread_locals, local_addr, preload_thread_locals_size(fetch_full));
       return thread_locals;
     }
     // The mapping might have been removed by crazy application code.
@@ -1316,7 +1351,7 @@ void Task::activate_preload_thread_locals() {
     if (local_addr) {
       Task* t = session().find_task(as->thread_locals_tuid());
       if (t) {
-        t->fetch_preload_thread_locals();
+        t->fetch_preload_thread_locals(true);
       }
       memcpy(local_addr, thread_locals, PRELOAD_THREAD_LOCALS_SIZE);
       as->set_thread_locals_tuid(tuid());
@@ -1370,53 +1405,59 @@ void Task::work_around_KNL_string_singlestep_bug() {
 
 void Task::resume_execution(ResumeRequest how, WaitRequest wait_how,
                             TicksRequest tick_period, int sig) {
-  will_resume_execution(how, wait_how, tick_period, sig);
+  bool setup_succeeded = will_resume_execution(how, wait_how, tick_period, sig);
 
-  if (tick_period != RESUME_NO_TICKS) {
-    if (tick_period == RESUME_UNLIMITED_TICKS) {
-      hpc.reset(0);
-    } else {
-      ASSERT(this, tick_period >= 0 && tick_period <= MAX_TICKS_REQUEST);
-      hpc.reset(max<Ticks>(1, tick_period));
-    }
-    activate_preload_thread_locals();
-  }
+  // During record, the process could have died, but otherwise, we control
+  // process lifecycles and this should never fail.
+  ASSERT(this, session().is_recording() || setup_succeeded);
 
-  LOG(debug) << "resuming execution of " << tid << " with "
-             << ptrace_req_name<NativeArch>(how)
-             << (sig ? string(", signal ") + signal_name(sig) : string())
-             << " tick_period " << tick_period << " wait " << wait_how;
-  set_x86_debug_status(0);
-
-  if (is_singlestep_resume(how)) {
-    work_around_KNL_string_singlestep_bug();
-    if (is_x86ish(arch())) {
-      singlestepping_instruction = trapped_instruction_at(this, ip());
-      if (singlestepping_instruction == TrappedInstruction::CPUID) {
-        // In KVM virtual machines (and maybe others), singlestepping over CPUID
-        // executes the following instruction as well. Work around that.
-        did_set_breakpoint_after_cpuid =
-          vm()->add_breakpoint(ip() + trapped_instruction_len(singlestepping_instruction), BKPT_INTERNAL);
+  if (setup_succeeded) {
+    if (tick_period != RESUME_NO_TICKS) {
+      if (tick_period == RESUME_UNLIMITED_TICKS) {
+        hpc.reset(0);
+      } else {
+        ASSERT(this, tick_period >= 0 && tick_period <= MAX_TICKS_REQUEST);
+        hpc.reset(max<Ticks>(1, tick_period));
       }
-    } else if (arch() == aarch64 && is_singlestep_resume(how_last_execution_resumed)) {
-      // On aarch64, if the last execution was any sort of single step, then
-      // resuming again with PTRACE_(SYSEMU_)SINGLESTEP will cause a debug fault
-      // immediately before executing the next instruction in userspace
-      // (essentially completing the singlestep that got "interrupted" by
-      // trapping into the kernel). To prevent this, we must re-arm the
-      // PSTATE.SS bit. (If the last resume was not a single step,
-      // the kernel will apply this modification).
-      if (!registers.aarch64_singlestep_flag()) {
-        registers.set_aarch64_singlestep_flag();
-        registers_dirty = true;
+      activate_preload_thread_locals();
+    }
+
+    LOG(debug) << "resuming execution of " << tid << " with "
+              << ptrace_req_name<NativeArch>(how)
+              << (sig ? string(", signal ") + signal_name(sig) : string())
+              << " tick_period " << tick_period << " wait " << wait_how;
+    set_x86_debug_status(0);
+
+    if (is_singlestep_resume(how)) {
+      work_around_KNL_string_singlestep_bug();
+      if (is_x86ish(arch())) {
+        singlestepping_instruction = trapped_instruction_at(this, ip());
+        if (singlestepping_instruction == TrappedInstruction::CPUID) {
+          // In KVM virtual machines (and maybe others), singlestepping over CPUID
+          // executes the following instruction as well. Work around that.
+          did_set_breakpoint_after_cpuid =
+            vm()->add_breakpoint(ip() + trapped_instruction_len(singlestepping_instruction), BKPT_INTERNAL);
+        }
+      } else if (arch() == aarch64 && is_singlestep_resume(how_last_execution_resumed)) {
+        // On aarch64, if the last execution was any sort of single step, then
+        // resuming again with PTRACE_(SYSEMU_)SINGLESTEP will cause a debug fault
+        // immediately before executing the next instruction in userspace
+        // (essentially completing the singlestep that got "interrupted" by
+        // trapping into the kernel). To prevent this, we must re-arm the
+        // PSTATE.SS bit. (If the last resume was not a single step,
+        // the kernel will apply this modification).
+        if (!registers.aarch64_singlestep_flag()) {
+          registers.set_aarch64_singlestep_flag();
+          registers_dirty = true;
+        }
       }
     }
+
+    address_of_last_execution_resume = ip();
+    how_last_execution_resumed = how;
+
+    flush_regs();
   }
-
-  address_of_last_execution_resume = ip();
-  how_last_execution_resumed = how;
-
-  flush_regs();
 
   pid_t wait_ret = 0;
   if (session().is_recording() && !is_dying()) {
@@ -1457,6 +1498,7 @@ void Task::resume_execution(ResumeRequest how, WaitRequest wait_how,
     // wait() will see this and report the ptrace-exit event.
     detected_unexpected_exit = true;
   } else {
+    ASSERT(this, setup_succeeded);
     ptrace_if_alive(how, nullptr, (void*)(uintptr_t)sig);
     is_stopped = false;
     extra_registers_known = false;
@@ -1845,6 +1887,22 @@ bool Task::wait_unexpected_exit() {
   return false;
 }
 
+void Task::do_ptrace_interrupt() {
+  ptrace_if_alive(PTRACE_INTERRUPT, nullptr, nullptr);
+  expecting_ptrace_interrupt_stop = 2;
+}
+
+bool Task::account_for_potential_ptrace_interrupt_stop(WaitStatus status) {
+  if (expecting_ptrace_interrupt_stop > 0) {
+    --expecting_ptrace_interrupt_stop;
+    if (is_signal_triggered_by_ptrace_interrupt(status.group_stop())) {
+      expecting_ptrace_interrupt_stop = 0;
+      return true;
+    }
+  }
+  return false;
+}
+
 void Task::wait(double interrupt_after_elapsed) {
   LOG(debug) << "going into blocking waitid(" << tid << ") ...";
   ASSERT(this, session().is_recording() || interrupt_after_elapsed == -1);
@@ -1858,9 +1916,12 @@ void Task::wait(double interrupt_after_elapsed) {
   int ret;
   while (true) {
     if (interrupt_after_elapsed == 0 && !sent_wait_interrupt) {
-      ptrace_if_alive(PTRACE_INTERRUPT, nullptr, nullptr);
+      do_ptrace_interrupt();
+      if (session().is_recording()) {
+        // Force this timeslice to end
+        session().as_record()->scheduler().expire_timeslice();
+      }
       sent_wait_interrupt = true;
-      expecting_ptrace_interrupt_stop = 2;
     }
 
     if (interrupt_after_elapsed > 0) {
@@ -1997,23 +2058,15 @@ void Task::did_waitpid(WaitStatus status) {
   // we decrement it on every stop such that while this counter is positive,
   // any group-stop could be one induced by PTRACE_INTERRUPT
   bool siginfo_overriden = false;
-  if (expecting_ptrace_interrupt_stop > 0) {
-    expecting_ptrace_interrupt_stop--;
-    if (is_signal_triggered_by_ptrace_interrupt(status.group_stop())) {
-      // Assume this was PTRACE_INTERRUPT and thus treat this as
-      // TIME_SLICE_SIGNAL instead.
-      if (session().is_recording()) {
-        // Force this timeslice to end
-        session().as_record()->scheduler().expire_timeslice();
-      }
-      status = WaitStatus::for_stop_sig(PerfCounters::TIME_SLICE_SIGNAL);
-      memset(&pending_siginfo, 0, sizeof(pending_siginfo));
-      pending_siginfo.si_signo = PerfCounters::TIME_SLICE_SIGNAL;
-      pending_siginfo.si_fd = hpc.ticks_interrupt_fd();
-      pending_siginfo.si_code = POLL_IN;
-      siginfo_overriden = true;
-      expecting_ptrace_interrupt_stop = 0;
-    }
+  if (account_for_potential_ptrace_interrupt_stop(status)) {
+    // Assume this was PTRACE_INTERRUPT and thus treat this as
+    // TIME_SLICE_SIGNAL instead.
+    status = WaitStatus::for_stop_sig(PerfCounters::TIME_SLICE_SIGNAL);
+    memset(&pending_siginfo, 0, sizeof(pending_siginfo));
+    pending_siginfo.si_signo = PerfCounters::TIME_SLICE_SIGNAL;
+    pending_siginfo.si_fd = hpc.ticks_interrupt_fd();
+    pending_siginfo.si_code = POLL_IN;
+    siginfo_overriden = true;
   }
 
   if (!siginfo_overriden && status.stop_sig()) {
@@ -2225,13 +2278,17 @@ static void setup_preload_thread_locals_from_clone_arch(Task* t, Task* origin) {
     t->activate_preload_thread_locals();
     auto locals = reinterpret_cast<preload_thread_locals<Arch>*>(local_addr);
     auto origin_locals = reinterpret_cast<const preload_thread_locals<Arch>*>(
-        origin->fetch_preload_thread_locals());
+        origin->fetch_preload_thread_locals(false));
     locals->alt_stack_nesting_level = origin_locals->alt_stack_nesting_level;
     // vfork() will restore the flags on the way out since its on the same
     // stack.
     locals->saved_flags = origin_locals->saved_flags;
     // clone() syscalls set the child stack pointer, so the child is no
     // longer in the syscallbuf code even if the parent was.
+    if (PRELOAD_THREAD_LOCAL_SCRATCH2_SIZE >= 8 * 2) {
+      // On aarch64, we use this to save and restore some register values across clone
+      memcpy(locals->stub_scratch_2, origin_locals->stub_scratch_2, 8 * 2);
+    }
   }
 }
 
@@ -2522,8 +2579,9 @@ Task::CapturedState Task::capture_state() {
       cloned_file_data_fd_child >= 0
           ? fd_offset(cloned_file_data_fd_child)
           : 0;
-  memcpy(&state.thread_locals, fetch_preload_thread_locals(),
-         PRELOAD_THREAD_LOCALS_SIZE);
+  bool fetch_full = need_fetch_full(this);
+  memcpy(&state.thread_locals, fetch_preload_thread_locals(fetch_full),
+         preload_thread_locals_size(fetch_full));
   state.syscallbuf_child = syscallbuf_child;
   state.syscallbuf_size = syscallbuf_size;
   state.preload_globals = preload_globals;
@@ -2574,7 +2632,8 @@ void Task::copy_state(const CapturedState& state) {
   }
   preload_globals = state.preload_globals;
   ASSERT(this, as->thread_locals_tuid() != tuid());
-  memcpy(&thread_locals, &state.thread_locals, PRELOAD_THREAD_LOCALS_SIZE);
+  memcpy(&thread_locals, &state.thread_locals,
+         preload_thread_locals_size(need_fetch_full(this)));
   // The scratch buffer (for now) is merely a private mapping in
   // the remote task.  The CoW copy made by fork()'ing the
   // address space has the semantics we want.  It's not used in
@@ -3913,6 +3972,9 @@ void Task::apply_syscall_entry_regs()
     registers.set_orig_arg1(registers.arg1());
     // Don't update registers_dirty here, because these registers are not part
     // of the ptrace state tracked by that flag.
+    ticks_at_last_syscall_entry = tick_count();
+    ip_at_last_syscall_entry = registers.ip();
+    last_syscall_entry_recorded = false;
   }
 }
 

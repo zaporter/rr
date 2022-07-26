@@ -13,17 +13,6 @@
 
 namespace rr {
 
-class ReplayCommand : public Command {
-public:
-  virtual int run(std::vector<std::string>& args) override;
-
-  static ReplayCommand* get() { return &singleton; }
-
-protected:
-  ReplayCommand(const char* name, const char* help) : Command(name, help) {}
-
-  static ReplayCommand singleton;
-};
 struct ReplayFlags {
   // Start a debug server for the task scheduled at the first
   // event at which reached this event AND target_process has
@@ -98,6 +87,18 @@ struct ReplayFlags {
         share_private_mappings(false),
         dump_interval(0),
         serve_files(false) {}
+};
+class ReplayCommand : public Command {
+public:
+  virtual int run(std::vector<std::string>& args) override;
+
+  static ReplayCommand* get() { return &singleton; }
+
+
+protected:
+  ReplayCommand(const char* name, const char* help) : Command(name, help) {}
+
+  static ReplayCommand singleton;
 };
 
 

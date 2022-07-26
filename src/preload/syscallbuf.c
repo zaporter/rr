@@ -427,14 +427,15 @@ static void logmsg(const char* msg) {
  * This is only called from syscall wrappers that are doing a proper
  * buffered syscall.
  */
-static long untraced_syscall_base(int syscallno, long a0, long a1, long a2,
+static long untraced_syscall_full(int syscallno, long a0, long a1, long a2,
                                   long a3, long a4, long a5,
-                                  void* syscall_instruction) {
+                                  void* syscall_instruction,
+                                  long stack_param_1, long stack_param_2) {
   struct syscallbuf_record* rec = (struct syscallbuf_record*)buffer_last();
   /* Ensure tools analyzing the replay can find the pending syscall result */
   thread_locals->pending_untraced_syscall_result = &rec->ret;
   long ret = _raw_syscall(syscallno, a0, a1, a2, a3, a4, a5,
-                          syscall_instruction, 0, 0);
+                          syscall_instruction, stack_param_1, stack_param_2);
 /* During replay, return the result that's already in the buffer, instead
    of what our "syscall" returned. */
 #if defined(__i386__) || defined(__x86_64__)
@@ -470,6 +471,8 @@ static long untraced_syscall_base(int syscallno, long a0, long a1, long a2,
 #endif
   return ret;
 }
+#define untraced_syscall_base(no, a0, a1, a2, a3, a4, a5, inst) \
+  untraced_syscall_full(no, a0, a1, a2, a3, a4, a5, inst, 0, 0)
 #define untraced_syscall6(no, a0, a1, a2, a3, a4, a5)                          \
   untraced_syscall_base(no, (uintptr_t)a0, (uintptr_t)a1, (uintptr_t)a2,       \
                         (uintptr_t)a3, (uintptr_t)a4, (uintptr_t)a5,           \
@@ -931,7 +934,10 @@ static void __attribute__((constructor)) init_process(void) {
       (uintptr_t)_syscall_hook_trampoline_b8_ca_00_00_00 },
   };
 #elif defined(__aarch64__)
-  struct syscall_patch_hook syscall_patch_hooks[] = {};
+  extern RR_HIDDEN void _syscall_hook_trampoline_raw(void);
+  struct syscall_patch_hook syscall_patch_hooks[] = {
+    { 0, 4, { 0x01, 0, 0, 0xd4 }, (uintptr_t)_syscall_hook_trampoline_raw }
+  };
 #endif
 
   assert(sizeof(struct preload_thread_locals) <= PRELOAD_THREAD_LOCALS_SIZE);
@@ -961,11 +967,9 @@ static void __attribute__((constructor)) init_process(void) {
   params.syscallbuf_enabled = buffer_enabled;
 
 #ifdef __i386__
-  params.syscallhook_vsyscall_entry = (void*)__morestack;
   params.get_pc_thunks_start = &_get_pc_thunks_start;
   params.get_pc_thunks_end = &_get_pc_thunks_end;
 #else
-  params.syscallhook_vsyscall_entry = NULL;
   params.get_pc_thunks_start = NULL;
   params.get_pc_thunks_end = NULL;
 #endif
@@ -3234,16 +3238,22 @@ static long sys_getsockopt(struct syscall_info* call) {
 
   assert(syscallno == call->no);
 
+  if (!start_commit_buffered_syscall(syscallno, ptr, MAY_BLOCK)) {
+    return traced_raw_syscall(call);
+  }
+
   memcpy_input_parameter(optlen2, optlen, sizeof(*optlen2));
   // Some variance of getsockopt does use the initial content of *optval
   // (e.g. SOL_IP + IPT_SO_GET_INFO) so we need to copy it.
   memcpy_input_parameter(optval2, optval, *optlen);
 
-  if (!start_commit_buffered_syscall(syscallno, ptr, MAY_BLOCK)) {
-    return traced_raw_syscall(call);
-  }
-
-  ret = untraced_syscall5(syscallno, sockfd, level, optname, optval2, optlen2);
+  // We may need to manually restart this syscall due to kernel bug
+  // returning a EFAULT when interrupted by signal and we won't have
+  // access to the actual arg1 on aarch64 in a normal way in such case.
+  // Pass in the arg1 in the stack argument so that we can use it in the tracer.
+  ret = untraced_syscall_full(syscallno, sockfd, level, optname,
+                              (long)optval2, (long)optlen2, 0,
+                              RR_PAGE_SYSCALL_UNTRACED_RECORDING_ONLY, sockfd, 0);
 
   if (ret >= 0) {
     socklen_t val_len = *optlen < *optlen2 ? *optlen : *optlen2;

@@ -55,6 +55,7 @@ set(supports32bit true)
 set(x86ish false)
 set(has_syscallbuf false)
 if (${CMAKE_SYSTEM_PROCESSOR} STREQUAL "aarch64")
+  set(has_syscallbuf true)
   set(supports32bit false)
   set(FLAGS_COMMON "${FLAGS_COMMON} -march=armv8.3-a -moutline-atomics")
   set(PRELOAD_LIBRARY_PAGE_SIZE 65536)
@@ -751,6 +752,11 @@ install(TARGETS ${RR_INSTALL_LIBS}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/rr
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}/rr)
 
+if(EXTRA_EXTERNAL_SOLIBS)
+  install(PROGRAMS ${EXTRA_EXTERNAL_SOLIBS}
+    DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
+
 # Build 32-bit librrpreload and librraudit on 64-bit builds.
 # We copy the source files into '32' subdirectories in the output
 # directory, so we can set different compile options on them.
@@ -960,6 +966,7 @@ set(BASIC_TESTS
   futex_priorities
   futex_requeue
   futex_restart_race
+  futex_restart_clone
   gcrypt_rdrand
   getcpu
   getgroups
@@ -1404,7 +1411,7 @@ set(TESTS_WITH_PROGRAM
   mmap_tmpfs
   mmap_write
   mmap_write_private
-  morestack_unwind
+  x86/morestack_unwind
   mprotect_growsdown
   mprotect_syscallbuf_overflow
   mutex_pi_stress

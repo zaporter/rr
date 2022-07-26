@@ -141,7 +141,8 @@ AutoRemoteSyscalls::AutoRemoteSyscalls(Task* t,
       sigmask_to_restore = rt->get_sigmask();
       sig_set_t all_blocked;
       memset(&all_blocked, 0xff, sizeof(all_blocked));
-      rt->set_sigmask(all_blocked);
+      // Ignore the process dying here - we'll notice later.
+      (void)rt->set_sigmask(all_blocked);
     }
   }
 }
@@ -251,6 +252,27 @@ void AutoRemoteSyscalls::restore_state_to(Task* t) {
   auto regs = initial_regs;
   regs.set_ip(initial_ip);
   regs.set_sp(initial_sp);
+  if (t->arch() == aarch64 && regs.syscall_may_restart()) {
+    // On AArch64, the kernel restarts aborted syscalls using an internal `orig_x0`.
+    // This gets overwritten everytime we make a syscall so we need to restore it
+    // if we are at a syscall that may restart.
+    // The kernel `orig_x0` isn't accessible from ptrace AFAICT but fortunately
+    // it does **NOT** get reset on syscall exit so we can actually set it's value
+    // just by making a dummy syscall with the correct x0 value.
+    auto restart_res = regs.syscall_result();
+    regs.set_ip(t->vm()->traced_syscall_ip());
+    // This can be any side-effect-free syscall that doesn't care about arg1.
+    // The kernel sets its `orig_x0` no matter whether the syscall actually needs it.
+    regs.set_syscallno(rr::ARM64Arch::getpid);
+    regs.set_arg1(regs.orig_arg1());
+    t->set_regs(regs);
+    if (t->enter_syscall(true)) {
+      t->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_NO_TICKS);
+    }
+    regs.set_ip(initial_ip);
+    regs.set_syscallno(regs.original_syscallno());
+    regs.set_syscall_result(restart_res);
+  }
   // If we were sitting at a seccomp trap, try to get back there by resuming
   // here. Since the original register contents caused a seccomp trap,
   // re-running the syscall with the same registers should put us right back
@@ -281,7 +303,7 @@ void AutoRemoteSyscalls::restore_state_to(Task* t) {
     // needs to be able to interrupt re-startable system calls, it is required
     // to set TIF_SIGPENDING, but the fact that this works is of course a very
     // deep implementation detail.
-    t->ptrace_if_alive(PTRACE_INTERRUPT, nullptr, nullptr);
+    t->do_ptrace_interrupt();
   }
 }
 
@@ -544,10 +566,14 @@ static long child_recvmsg(AutoRemoteSyscalls& remote, int child_sock) {
   return their_fd;
 }
 
-static int recvmsg_socket(ScopedFd& sock) {
+static int recvmsg_socket(ScopedFd& sock, bool blocking=true) {
   fd_message<NativeArch> msg;
   struct msghdr *msgp = (struct msghdr*)&msg.msg;
-  if (0 > recvmsg(sock, msgp, MSG_CMSG_CLOEXEC)) {
+  int flag = MSG_CMSG_CLOEXEC;
+  if (!blocking) {
+    flag |= MSG_DONTWAIT;
+  }
+  if (0 > recvmsg(sock, msgp, flag)) {
     return -1;
   }
 
@@ -604,8 +630,13 @@ template <typename Arch> int AutoRemoteSyscalls::send_fd_arch(const ScopedFd &ou
       child_recvmsg<Arch>(*this, task()->session().tracee_fd_number());
   if (child_syscall_result == -ESRCH) {
     /* The child did not receive the message. Read it out of the socket
-       buffer so it doesn't get read by another child later! */
-    int fd = recvmsg_socket(task()->session().tracee_socket_receiver_fd());
+     * buffer so it doesn't get read by another child later!
+     * Note that if the child was killed, we might get an error
+     * (i.e. process exit stop before syscall exit stop) even
+     * if the fd is already removed from the socket.
+     * Because of this, we use a non-blocking recvmsg to avoid blocking forever.
+     */
+    int fd = recvmsg_socket(task()->session().tracee_socket_receiver_fd(), false);
     if (fd >= 0) {
       ASSERT(t, fd != our_fd.get()) << "This should always return a fresh fd!";
       close(fd);

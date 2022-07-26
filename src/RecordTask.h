@@ -77,13 +77,14 @@ public:
   virtual void post_wait_clone(Task* cloned_from, int flags) override;
   virtual void on_syscall_exit(int syscallno, SupportedArch arch,
                                const Registers& regs) override;
-  virtual void will_resume_execution(ResumeRequest, WaitRequest, TicksRequest,
+  virtual bool will_resume_execution(ResumeRequest, WaitRequest, TicksRequest,
                                      int /*sig*/) override;
   virtual void did_wait() override;
 
   std::vector<remote_code_ptr> syscallbuf_syscall_entry_breakpoints();
   bool is_at_syscallbuf_syscall_entry_breakpoint();
   bool is_at_syscallbuf_final_instruction_breakpoint();
+  bool is_at_syscallstub_exit_breakpoint();
 
   /**
    * Initialize tracee buffers in this, i.e., implement
@@ -357,6 +358,10 @@ public:
   /**
    * Return true if this is within the syscallbuf library.  This
    * *does not* imply that $ip is at a buffered syscall.
+   * This also includes the runtime stub code that runs
+   * before entering syscallbuf but does not include the "safe area".
+   * Returning true from this function implies that the code will execute
+   * `_syscallbuf_final_exit_instruction` before returning to normal code.
    */
   bool is_in_syscallbuf();
   /**
@@ -558,8 +563,9 @@ public:
   sig_set_t read_sigmask_from_process();
   /**
    * Unblock the signal for the process.
+   * Returns `false` if the process died underneath us.
    */
-  void unblock_signal(int sig);
+  bool unblock_signal(int sig);
   /**
    * Set the signal handler to default for the process.
    */
@@ -610,7 +616,7 @@ public:
    */
   void send_synthetic_SIGCHLD_if_necessary();
 
-  void set_sigmask(sig_set_t mask);
+  bool set_sigmask(sig_set_t mask);
 
 private:
   /* Retrieve the tid of this task from the tracee and store it */
@@ -780,6 +786,7 @@ public:
   bool break_at_syscallbuf_traced_syscalls;
   bool break_at_syscallbuf_untraced_syscalls;
   bool break_at_syscallbuf_final_instruction;
+  remote_code_ptr syscallstub_exit_breakpoint;
 
   // The pmc is programmed to interrupt at a value requested by the tracee, not
   // by rr.

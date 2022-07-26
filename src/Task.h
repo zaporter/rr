@@ -308,6 +308,10 @@ public:
    * Emulate a jump to a new IP, updating the ticks counter as appropriate.
    */
   void emulate_jump(remote_code_ptr);
+  void count_direct_jump()
+  {
+    ticks += PerfCounters::ticks_for_unconditional_direct_branch(this);
+  }
 
   /**
    * Return true if this is at an arm-desched-event or
@@ -342,7 +346,14 @@ public:
    * instruction.
    */
   bool is_in_untraced_syscall() {
-    auto t = AddressSpace::rr_page_syscall_from_exit_point(arch(), ip());
+    const AddressSpace::SyscallType *t;
+    if (arch() == aarch64 && stop_sig() > 0) {
+      // On aarch64 we can't distinguish untraced syscall entry and exit
+      // when a signal happened
+      t = AddressSpace::rr_page_syscall_from_entry_point(arch(), ip());
+    } else {
+      t = AddressSpace::rr_page_syscall_from_exit_point(arch(), ip());
+    }
     return t && t->traced == AddressSpace::UNTRACED;
   }
 
@@ -373,9 +384,11 @@ public:
 
   /**
    * Hook called by `resume_execution`.
+   * Returns `false` if the task is in the process of dying and setup could not
+   * be completed, `true` otherwise.
    */
-  virtual void will_resume_execution(ResumeRequest, WaitRequest, TicksRequest,
-                                     int /*sig*/) {}
+  virtual bool will_resume_execution(ResumeRequest, WaitRequest, TicksRequest,
+                                     int /*sig*/) { return true; }
   /**
    * Hook called by `did_waitpid`.
    */
@@ -796,6 +809,26 @@ public:
    */
   void open_mem_fd_if_needed();
 
+  /**
+   * Perform a PTRACE_INTERRUPT set up the counter for potential spurious stops
+   * to be detected in `account_for_potential_ptrace_interrupt_stop`.
+   */
+  void do_ptrace_interrupt();
+
+  /**
+   * Sometimes we use PTRACE_INTERRUPT to kick the tracee out of various
+   * undesirable states. Unfortunately, that can (but need not) result in later
+   * undesired GROUP-STOP-SIGTRAP stops which report the PTRACE_INTERRUPT.
+   * This function may be called when examining stops to account for any
+   * such spurious stops.
+   *
+   * Should be called at exactly once for every ptrace stop.
+   *
+   * Returns true if the stop is caused by a PTRACE_INTERRUPT we know about,
+   * false otherwise.
+   */
+  bool account_for_potential_ptrace_interrupt_stop(WaitStatus status);
+
   /* Imagine that task A passes buffer |b| to the read()
    * syscall.  Imagine that, after A is switched out for task B,
    * task B then writes to |b|.  Then B is switched out for A.
@@ -880,7 +913,9 @@ public:
   }
   void setup_preload_thread_locals();
   void setup_preload_thread_locals_from_clone(Task* origin);
-  const ThreadLocals& fetch_preload_thread_locals();
+  // If `fetch_full` is false, avoid fetching the full stub_scratch_2 on aarch64
+  // and only fetch the first two pointers from it.
+  const ThreadLocals& fetch_preload_thread_locals(bool fetch_full);
   void activate_preload_thread_locals();
 
   struct CapturedState {
@@ -1003,6 +1038,14 @@ public:
    * Just forget that this Task exists. Another rr process will manage it.
    */
   void forget();
+
+  // Used on aarch64 to detect whether we've recorded x0 and x8 on syscall entry
+  Ticks ticks_at_last_syscall_entry;
+  remote_code_ptr ip_at_last_syscall_entry;
+  // Whether the syscall entry corresponding to `{ticks,ip}_at_last_syscall_entry`
+  // has been recorded in the trace
+  // (used to avoid double recording on unexpected exit)
+  bool last_syscall_entry_recorded;
 
 protected:
   Task(Session& session, pid_t tid, pid_t rec_tid, uint32_t serial,

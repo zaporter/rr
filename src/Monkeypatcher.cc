@@ -273,14 +273,214 @@ static remote_ptr<uint8_t> allocate_extended_jump_x86ish(
   return jump_addr;
 }
 
-bool Monkeypatcher::is_jump_stub_instruction(remote_code_ptr ip) {
+/**
+ * Encode the standard movz|movk sequence for moving constant `v` into register `reg`
+ */
+static void encode_immediate_aarch64(std::vector<uint32_t> &buff,
+                                     uint8_t reg, uint64_t v)
+{
+  DEBUG_ASSERT(reg < 31);
+  const uint32_t movz_inst = 0xd2800000;
+  const uint32_t movk_inst = 0xf2800000;
+  uint32_t mov_inst = movz_inst;
+  for (int lsl = 3; lsl >= 0; lsl--) {
+    uint32_t bits = (v >> (lsl * 16)) & 0xffff;
+    if (bits == 0 && !(lsl == 0 && mov_inst == movz_inst)) {
+      // Skip zero bits unless it's the only instruction, i.e. v == 0
+      continue;
+    }
+    // movz|movk x[reg], #bits, LSL #lsl
+    buff.push_back(mov_inst | (uint32_t(lsl) << 21) | (bits << 5) | reg);
+    mov_inst = movk_inst;
+  }
+}
+
+/**
+ * Encode the following assembly.
+ *
+ *    cmp     x8, 1024
+ *    b.hi    .Lnosys
+ *    movk    x8, preload_thread_locals >> 16, lsl 16
+ *    stp     x15, x30, [x8, stub_scratch_2 - preload_thread_locals]
+ *    movz    x30, #:abs_g3:_syscall_hook_trampoline
+ *    movk    x30, #:abs_g2_nc:_syscall_hook_trampoline
+ *    movk    x30, #:abs_g1_nc:_syscall_hook_trampoline
+ *    movk    x30, #:abs_g0_nc:_syscall_hook_trampoline // Might be shorter depending on the address
+ *    blr     x30
+ *    ldp     x15, x30, [x15]
+.Lreturn:
+ *    b       syscall_return_address
+.Lnosys:
+ *    svc     0x0 // the test relies on invalid syscall triggering an event.
+ *    // mov     x0, -ENOSYS
+ *    b       .Lreturn
+ *    .long <syscall return address>
+ *
+ * And return the instruction index of `.Lreturn`.
+ * The branch instruction following that label will not be encoded
+ * since it depends on the address of this code.
+ */
+static uint32_t encode_extended_jump_aarch64(std::vector<uint32_t> &buff,
+                                             uint64_t target, uint64_t return_addr,
+                                             uint32_t *_retaddr_idx = nullptr)
+{
+  // cmp x8, 1024
+  buff.push_back(0xf110011f);
+  uint32_t b_hi_idx = buff.size();
+  buff.push_back(0); // place holder
+  // movk x8, preload_thread_locals >> 16, lsl 16
+  buff.push_back(0xf2ae0028);
+  // stp x15, x30, [x8, #104]
+  buff.push_back(0xa906f90f);
+  encode_immediate_aarch64(buff, 30, target);
+  // blr x30
+  buff.push_back(0xd63f03c0);
+  // ldp x15, x30, [x15]
+  buff.push_back(0xa94079ef);
+  uint32_t ret_idx = buff.size();
+  buff.push_back(0); // place holder
+  // b.hi . + (ret_inst + 4 - .)
+  buff[b_hi_idx] = 0x54000000 | ((ret_idx + 1 - b_hi_idx) << 5) | 0x8;
+  // movn x0, (ENOSYS - 1), i.e. mov x0, -ENOSYS
+  // buff.push_back(0x92800000 | ((ENOSYS - 1) << 5) | 0);
+  buff.push_back(0xd4000001); // svc 0
+  // b .-2
+  buff.push_back(0x17fffffe);
+  uint32_t retaddr_idx = buff.size();
+  if (_retaddr_idx)
+    *_retaddr_idx = retaddr_idx;
+  buff.resize(retaddr_idx + 2);
+  memcpy(&buff[retaddr_idx], &return_addr, 8);
+  return ret_idx;
+}
+
+// b and bl has a 26bit signed immediate in unit of 4 bytes
+constexpr int32_t aarch64_b_max_offset = ((1 << 25) - 1) * 4;
+constexpr int32_t aarch64_b_min_offset = (1 << 25) * -4;
+
+static remote_ptr<uint8_t> allocate_extended_jump_aarch64(
+    RecordTask* t, vector<Monkeypatcher::ExtendedJumpPage>& pages,
+    remote_ptr<uint8_t> svc_ip, uint64_t to, std::vector<uint32_t> &inst_buff) {
+  uint64_t return_addr = svc_ip.as_int() + 4;
+  auto ret_idx = encode_extended_jump_aarch64(inst_buff, to, return_addr);
+  auto total_patch_size = inst_buff.size() * 4;
+
+  Monkeypatcher::ExtendedJumpPage* page = nullptr;
+
+  // There are two jumps we need to worry about for the offset
+  // (actually 3 since there's also the jump back after unpatching
+  //  but the requirement for that is always more relaxed than the combination
+  //  of these two),
+  // the jump to the stub and the jump back.
+  // The jump to the stub has offset `stub - syscall` and the jump back has offset
+  // `syscall + 4 - (stub + ret_idx * 4)`
+  // We need to make sure both are within the offset range so
+  // * aarch64_b_min_offset <= stub - syscall <= aarch64_b_max_offset
+  // * aarch64_b_min_offset <= syscall + 4 - (stub + ret_idx * 4) <= aarch64_b_max_offset
+  // or
+  // * aarch64_b_min_offset <= stub - syscall <= aarch64_b_max_offset
+  // * -aarch64_b_max_offset + 4 - ret_idx * 4 <= stub - syscall <= -aarch64_b_min_offset + 4 - ret_idx * 4
+
+  int64_t patch_offset_min = std::max(aarch64_b_min_offset,
+                                      -aarch64_b_max_offset + 4 - int(ret_idx) * 4);
+  int64_t patch_offset_max = std::min(aarch64_b_max_offset,
+                                      -aarch64_b_min_offset + 4 - int(ret_idx) * 4);
+  for (auto& p : pages) {
+    remote_ptr<uint8_t> page_jump_start = p.addr + p.allocated;
+    int64_t offset = page_jump_start - svc_ip;
+    if (offset <= patch_offset_max && offset >= patch_offset_min &&
+        p.allocated + total_patch_size <= page_size()) {
+      page = &p;
+      break;
+    }
+  }
+
+  if (!page) {
+    // We're looking for a gap of three pages --- one page to allocate and
+    // a page on each side as a guard page.
+    uint32_t required_space = 3 * page_size();
+    remote_ptr<void> free_mem =
+        t->vm()->find_free_memory(required_space,
+                                  // Find free space after the patch site.
+                                  t->vm()->mapping_of(svc_ip).map.start());
+
+    remote_ptr<uint8_t> addr = (free_mem + page_size()).cast<uint8_t>();
+    int64_t offset = addr - svc_ip;
+    if (offset > patch_offset_max || offset < patch_offset_min) {
+      LOG(debug) << "Can't find space close enough for the jump";
+      return nullptr;
+    }
+
+    {
+      AutoRemoteSyscalls remote(t);
+      int prot = PROT_READ | PROT_EXEC;
+      int flags = MAP_ANONYMOUS | MAP_FIXED | MAP_PRIVATE;
+      auto ret = remote.infallible_mmap_syscall_if_alive(addr, page_size(), prot, flags, -1, 0);
+      if (!ret) {
+        /* Tracee died */
+        return nullptr;
+      }
+      KernelMapping recorded(addr, addr + page_size(), string(),
+                             KernelMapping::NO_DEVICE, KernelMapping::NO_INODE,
+                             prot, flags);
+      t->vm()->map(t, addr, page_size(), prot, flags, 0, string(),
+                   KernelMapping::NO_DEVICE, KernelMapping::NO_INODE, nullptr,
+                   &recorded);
+      t->vm()->mapping_flags_of(addr) |= AddressSpace::Mapping::IS_PATCH_STUBS;
+      t->trace_writer().write_mapped_region(t, recorded, recorded.fake_stat(),
+                                            recorded.fsname(),
+                                            vector<TraceRemoteFd>(),
+                                            TraceWriter::PATCH_MAPPING);
+    }
+
+    pages.push_back(Monkeypatcher::ExtendedJumpPage(addr));
+    page = &pages.back();
+  }
+
+  remote_ptr<uint8_t> jump_addr = page->addr + page->allocated;
+
+  const uint64_t reverse_jump_addr = jump_addr.as_int() + ret_idx * 4;
+  const int64_t reverse_offset = int64_t(return_addr - reverse_jump_addr);
+  const uint32_t offset_imm26 = (reverse_offset >> 2) & 0x03ffffff;
+  inst_buff[ret_idx] = 0x14000000 | offset_imm26;
+
+  page->allocated += total_patch_size;
+
+  return jump_addr;
+}
+
+bool Monkeypatcher::is_jump_stub_instruction(remote_code_ptr ip, bool include_safearea) {
   remote_ptr<uint8_t> pp = ip.to_data_ptr<uint8_t>();
   auto it = syscallbuf_stubs.upper_bound(pp);
   if (it == syscallbuf_stubs.begin()) {
     return false;
   }
   --it;
-  return it->first <= pp && pp < it->first + it->second.size;
+  auto begin = it->first;
+  auto end = begin + it->second.size;
+  if (!include_safearea) {
+    begin += it->second.safe_prefix;
+    end -= it->second.safe_suffix;
+  }
+  return begin <= pp && pp < end;
+}
+
+remote_code_ptr Monkeypatcher::get_jump_stub_exit_breakpoint(remote_code_ptr ip,
+                                                             RecordTask *t) {
+  if (t->arch() != aarch64) {
+    return nullptr;
+  }
+  remote_ptr<uint8_t> pp = ip.to_data_ptr<uint8_t>();
+  auto it = syscallbuf_stubs.upper_bound(pp);
+  if (it == syscallbuf_stubs.begin()) {
+    return nullptr;
+  }
+  --it;
+  auto bp = it->first + it->second.size - it->second.safe_suffix;
+  if (pp == bp || pp == bp - 4) {
+    return remote_code_ptr(bp.as_int());
+  }
+  return nullptr;
 }
 
 /**
@@ -405,13 +605,62 @@ bool patch_syscall_with_hook_arch<X64Arch>(Monkeypatcher& patcher,
 }
 
 template <>
-bool patch_syscall_with_hook_arch<ARM64Arch>(Monkeypatcher&,
-                                             RecordTask*,
-                                             const syscall_patch_hook&,
+bool patch_syscall_with_hook_arch<ARM64Arch>(Monkeypatcher& patcher,
+                                             RecordTask *t,
+                                             const syscall_patch_hook &hook,
                                              size_t,
                                              uint32_t) {
-  FATAL() << "Unimplemented";
-  return false;
+  Registers r = t->regs();
+  remote_ptr<uint8_t> svc_ip = r.ip().to_data_ptr<uint8_t>();
+  std::vector<uint32_t> inst_buff;
+
+  remote_ptr<uint8_t> extended_jump_start =
+    allocate_extended_jump_aarch64(
+      t, patcher.extended_jump_pages, svc_ip, hook.hook_address, inst_buff);
+  if (extended_jump_start.is_null()) {
+    return false;
+  }
+  LOG(debug) << "Allocated stub size " << inst_buff.size() * sizeof(uint32_t)
+             << " bytes at " << extended_jump_start << " for syscall at "
+             << svc_ip;
+
+  auto total_patch_size = inst_buff.size() * 4;
+  write_and_record_bytes(t, extended_jump_start, total_patch_size, &inst_buff[0]);
+
+  patcher.syscallbuf_stubs[extended_jump_start] = {
+    &hook, total_patch_size,
+    /**
+     * safe_prefix:
+     * We have not modified any registers yet in the first two instructions.
+     * More importantly, we may bail out and return to user code without
+     * hitting the breakpoint in syscallbuf
+     */
+    2 * 4,
+    /**
+     * safe_suffix:
+     * We've returned from syscallbuf and continue execution
+     * won't hit syscallbuf breakpoint
+     * (this also include the 8 bytes that stores the return address)
+     * Note that the 4th last instruction also belongs to the syscallbuf return path
+     * However, since it is still using the scratch memory,
+     * it doesn't belong to the safe area.
+     * The caller needs to have special handling for that instruction.
+     */
+    3 * 4 + 8
+  };
+
+  intptr_t jump_offset = extended_jump_start - svc_ip;
+  ASSERT(t, jump_offset <= aarch64_b_max_offset && jump_offset >= aarch64_b_min_offset)
+      << "allocate_extended_jump_aarch64 didn't work";
+
+  const uint32_t offset_imm26 = (jump_offset >> 2) & 0x03ffffff;
+  const uint32_t b_inst = 0x14000000 | offset_imm26;
+  bool ok = true;
+  write_and_record_bytes(t, svc_ip, 4, &b_inst, &ok);
+  if (!ok) {
+    LOG(warn) << "Couldn't write patch; errno=" << errno;
+  }
+  return ok;
 }
 
 
@@ -424,29 +673,50 @@ static bool patch_syscall_with_hook(Monkeypatcher& patcher, RecordTask* t,
 }
 
 template <typename ExtendedJumpPatch>
-static bool match_extended_jump_patch(uint8_t patch[],
- uint64_t *return_addr);
+static bool match_extended_jump_patch(Task* t,
+  uint8_t patch[], uint64_t* return_addr, vector<uint8_t>* instruction);
 
 template <>
 bool match_extended_jump_patch<X64SyscallStubExtendedJump>(
-      uint8_t patch[], uint64_t *return_addr) {
+      Task*, uint8_t patch[], uint64_t* return_addr, vector<uint8_t>* instruction) {
   uint32_t return_addr_lo, return_addr_hi;
   uint64_t jmp_target;
   if (!X64SyscallStubExtendedJump::match(patch, &return_addr_lo, &return_addr_hi, &jmp_target)) {
     return false;
   }
+  *instruction = rr::syscall_instruction(x86_64);
   *return_addr = return_addr_lo | (((uint64_t)return_addr_hi) << 32);
   return true;
 }
 
 template <>
+bool match_extended_jump_patch<X64TrapInstructionStubExtendedJump>(
+      Task* t, uint8_t patch[], uint64_t* return_addr, vector<uint8_t>* instruction) {
+  uint32_t return_addr_lo, return_addr_hi, fake_syscall_no;
+  uint64_t jmp_target;
+  if (!X64TrapInstructionStubExtendedJump::match(patch, &return_addr_lo, &return_addr_hi,
+                                                 &fake_syscall_no, &jmp_target)) {
+    return false;
+  }
+  *return_addr = return_addr_lo | (((uint64_t)return_addr_hi) << 32);
+  if ((int)fake_syscall_no == t->session().syscall_number_for_rrcall_rdtsc()) {
+    instruction->resize(sizeof(rdtsc_insn));
+    memcpy(instruction->data(), rdtsc_insn, instruction->size());
+  } else {
+    ASSERT(t, false) << "Unknown fake-syscall number " << fake_syscall_no;
+  }
+  return true;
+}
+
+template <>
 bool match_extended_jump_patch<X86SyscallStubExtendedJump>(
-      uint8_t patch[], uint64_t *return_addr) {
+      Task*, uint8_t patch[], uint64_t* return_addr, vector<uint8_t>* instruction) {
   uint32_t return_addr_32, jmp_target_relative;
   if (!X86SyscallStubExtendedJump::match(patch, &return_addr_32, &jmp_target_relative)) {
     return false;
   }
   *return_addr = return_addr_32;
+  *instruction = rr::syscall_instruction(x86);
   return true;
 }
 
@@ -472,21 +742,32 @@ void substitute_replacement_patch<X86SyscallStubRestore>(uint8_t *buffer, uint64
   X86SyscallStubRestore::substitute(buffer, (uint32_t)offset);
 }
 
-template <typename ExtendedJumpPatch, typename ReplacementPatch>
+template <typename ExtendedJumpPatch, typename FakeSyscallExtendedJumpPatch, typename ReplacementPatch>
 static void unpatch_extended_jumps(Monkeypatcher& patcher,
                                    Task* t) {
+  // If these were the same size then the logic below wouldn't work.
+  static_assert(ExtendedJumpPatch::size < FakeSyscallExtendedJumpPatch::size);
   for (auto patch : patcher.syscallbuf_stubs) {
     const syscall_patch_hook &hook = *patch.second.hook;
-    ASSERT(t, patch.second.size == ExtendedJumpPatch::size);
-    uint8_t bytes[ExtendedJumpPatch::size];
-    t->read_bytes_helper(patch.first, sizeof(bytes), bytes);
-    uint64_t return_addr;
-    if (!match_extended_jump_patch<ExtendedJumpPatch>(bytes, &return_addr)) {
-      ASSERT(t, false) << "Failed to match extended jump patch at " << patch.first;
-      return;
+    uint8_t bytes[FakeSyscallExtendedJumpPatch::size];
+    t->read_bytes_helper(patch.first, patch.second.size, bytes);
+    uint64_t return_addr = 0;
+    vector<uint8_t> syscall;
+    if (patch.second.size == ExtendedJumpPatch::size) {
+      if (!match_extended_jump_patch<ExtendedJumpPatch>(
+              t, bytes, &return_addr, &syscall)) {
+        ASSERT(t, false) << "Failed to match extended jump patch at " << patch.first;
+        return;
+      }
+    } else if (patch.second.size == FakeSyscallExtendedJumpPatch::size) {
+      if (!match_extended_jump_patch<FakeSyscallExtendedJumpPatch>(
+              t, bytes, &return_addr, &syscall)) {
+        ASSERT(t, false) << "Failed to match trap-instruction extended jump patch at " << patch.first;
+        return;
+      }
+    } else {
+      ASSERT(t, false) << "Unknown patch size " << patch.second.size;
     }
-
-    std::vector<uint8_t> syscall = rr::syscall_instruction(t->arch());
 
     // Replace with
     //  extended_jump:
@@ -496,9 +777,9 @@ static void unpatch_extended_jumps(Monkeypatcher& patcher,
     //    jmp *(return_addr)
     // As long as there are not relative branches or anything, this should
     // always be correct.
-    ASSERT(t, hook.patch_region_length + ReplacementPatch::size + syscall.size() <
-              ExtendedJumpPatch::size);
-    uint8_t *ptr = bytes;
+    size_t new_patch_size = hook.patch_region_length + syscall.size() + ReplacementPatch::size;
+    ASSERT(t, new_patch_size <= sizeof(bytes));
+    uint8_t* ptr = bytes;
     if (!(hook.flags & PATCH_SYSCALL_INSTRUCTION_IS_LAST)) {
       memcpy(ptr, syscall.data(), syscall.size());
       ptr += syscall.size();
@@ -510,8 +791,8 @@ static void unpatch_extended_jumps(Monkeypatcher& patcher,
       ptr += syscall.size();
     }
     substitute_replacement_patch<ReplacementPatch>(ptr,
-      patch.first.as_int()+(ptr-bytes), return_addr);
-    t->write_bytes_helper(patch.first, sizeof(bytes), bytes);
+      patch.first.as_int() + hook.patch_region_length + syscall.size(), return_addr);
+    t->write_bytes_helper(patch.first, new_patch_size, bytes);
   }
 }
 
@@ -520,20 +801,56 @@ static void unpatch_syscalls_arch(Monkeypatcher &patcher, Task *t);
 
 template <>
 void unpatch_syscalls_arch<X86Arch>(Monkeypatcher &patcher, Task *t) {
+  // There is no 32-bit equivalent to X64TrapInstructionStubExtendedJump.
+  // We just pass the X64TrapInstructionStubExtendedJump; its length
+  // will never match any jump stub for 32-bit.
   return unpatch_extended_jumps<X86SyscallStubExtendedJump,
+                                X64TrapInstructionStubExtendedJump,
                                 X86SyscallStubRestore>(patcher, t);
 }
 
 template <>
 void unpatch_syscalls_arch<X64Arch>(Monkeypatcher &patcher, Task *t) {
   return unpatch_extended_jumps<X64SyscallStubExtendedJump,
+                                X64TrapInstructionStubExtendedJump,
                                 X64SyscallStubRestore>(patcher, t);
 }
 
 template <>
 void unpatch_syscalls_arch<ARM64Arch>(Monkeypatcher &patcher, Task *t) {
-  (void)patcher; (void)t;
-  // FATAL() << "Unimplemented";
+  for (auto patch : patcher.syscallbuf_stubs) {
+    const syscall_patch_hook &hook = *patch.second.hook;
+    std::vector<uint32_t> hook_prefix;
+    uint32_t prefix_ninst;
+    encode_extended_jump_aarch64(hook_prefix, hook.hook_address, 0, &prefix_ninst);
+    uint32_t prefix_size = prefix_ninst * 4;
+    DEBUG_ASSERT(prefix_size <= 13 * 4);
+    ASSERT(t, patch.second.size >= prefix_size + 8);
+    uint8_t bytes[15 * 4];
+    t->read_bytes_helper(patch.first, prefix_size + 8, bytes);
+    // 3rd last instruction is the one jumping back and it won't match
+    if (memcmp(&hook_prefix[0], bytes, prefix_size - 3 * 4) != 0) {
+      ASSERT(t, false) << "Failed to match extended jump patch at " << patch.first;
+      return;
+    }
+
+    uint64_t return_addr;
+    memcpy(&return_addr, &bytes[prefix_size], 8);
+
+    uint32_t svc_inst = 0xd4000001;
+    memcpy(bytes, &svc_inst, 4);
+
+    uint64_t reverse_jump_addr = patch.first.as_int() + 4;
+    int64_t reverse_offset = int64_t(return_addr - reverse_jump_addr);
+    ASSERT(t, reverse_offset <= aarch64_b_max_offset &&
+           reverse_offset >= aarch64_b_min_offset)
+      << "Cannot encode b instruction to jump back";
+    uint32_t offset_imm26 = (reverse_offset >> 2) & 0x03ffffff;
+    uint32_t binst = 0x14000000 | offset_imm26;
+    memcpy(&bytes[4], &binst, 4);
+
+    t->write_bytes_helper(patch.first, 4 * 2, bytes);
+  }
 }
 
 void Monkeypatcher::unpatch_syscalls_in(Task *t) {
@@ -796,9 +1113,64 @@ bool Monkeypatcher::try_patch_syscall_x86ish(RecordTask* t, bool entering_syscal
   return true;
 }
 
-bool Monkeypatcher::try_patch_syscall_aarch64(RecordTask*, bool) {
-  FATAL() << "Unimplemented";
-  return false;
+bool Monkeypatcher::try_patch_syscall_aarch64(RecordTask* t, bool entering_syscall) {
+  Registers r = t->regs();
+  remote_code_ptr ip = r.ip() - 4;
+
+  uint32_t inst[2] = {0, 0};
+  size_t bytes_count = t->read_bytes_fallible(ip.to_data_ptr<uint8_t>() - 4, 8, &inst);
+  if (bytes_count < sizeof(inst) || inst[1] != 0xd4000001) {
+    LOG(debug) << "Declining to patch syscall at "
+               << ip << " for unexpected instruction";
+    tried_to_patch_syscall_addresses.insert(ip);
+    return false;
+  }
+  // mov x8, 0xdc
+  if (inst[0] == 0xd2801b88) {
+    // Clone may either cause the new and the old process to share stack (vfork)
+    // or replacing the stack (pthread_create)
+    // and requires special handling on the caller.
+    // Our syscall hook cannot do that so this would have to be a raw syscall.
+    // We can handle this at runtime but if we know the call is definitely
+    // a clone we can avoid patching it here.
+    LOG(debug) << "Declining to patch clone syscall at " << ip;
+    tried_to_patch_syscall_addresses.insert(ip);
+    return false;
+  }
+
+  ASSERT(t, (syscall_hooks.size() == 1 && syscall_hooks[0].patch_region_length == 4 &&
+             memcmp(syscall_hooks[0].patch_region_bytes, &inst[1], 4) == 0))
+    << "Unknown syscall hook";
+
+  if (!safe_for_syscall_patching(ip, ip + 4, t)) {
+    LOG(debug)
+      << "Temporarily declining to patch syscall at " << ip
+      << " because a different task has its ip in the patched range";
+    return false;
+  }
+
+  // Get out of executing the current syscall before we patch it.
+  if (entering_syscall && !t->exit_syscall_and_prepare_restart()) {
+    return false;
+  }
+
+  LOG(debug) << "Patching syscall at " << ip << " syscall "
+             << syscall_name(r.original_syscallno(), aarch64) << " tid " << t->tid;
+
+  auto success = patch_syscall_with_hook(*this, t, syscall_hooks[0], 4, 0);
+  if (!success && entering_syscall) {
+    // Need to reenter the syscall to undo exit_syscall_and_prepare_restart
+    t->enter_syscall();
+  }
+
+  if (!success) {
+    LOG(debug) << "Failed to patch syscall at " << ip << " syscall "
+               << syscall_name(r.original_syscallno(), aarch64) << " tid " << t->tid;
+    tried_to_patch_syscall_addresses.insert(ip);
+    return false;
+  }
+
+  return true;
 }
 
 bool Monkeypatcher::try_patch_syscall(RecordTask* t, bool entering_syscall) {
@@ -827,7 +1199,7 @@ bool Monkeypatcher::try_patch_syscall(RecordTask* t, bool entering_syscall) {
   // the check for the syscall restart should prevent us from reaching here.
   DEBUG_ASSERT(ip.to_data_ptr<void>() < AddressSpace::rr_page_start() ||
                ip.to_data_ptr<void>() >= AddressSpace::rr_page_end());
-  if (tried_to_patch_syscall_addresses.count(ip)) {
+  if (tried_to_patch_syscall_addresses.count(ip) || is_jump_stub_instruction(ip, true)) {
     return false;
   }
 

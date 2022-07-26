@@ -1379,15 +1379,14 @@ GdbServer::ContinueOrStop GdbServer::debug_one_step(
     // if tids get reused.
     RunCommand command = compute_run_command_for_reverse_exec(
         timeline.current_session(), debuggee_tguid, req, allowed_tasks);
-    auto stop_filter = [&](ReplayTask* t) -> bool {
+    auto stop_filter = [&](ReplayTask* t, const BreakStatus &break_status) -> bool {
       if (t->thread_group()->tguid() != debuggee_tguid) {
         return false;
       }
 
       // don't stop for a signal that has been specified by QPassSignal
-      Event const& stop_event = t->current_trace_frame().event();
-      if (stop_event.is_signal_event() && dbg->is_pass_signal(stop_event.Signal().siginfo.si_signo)) {
-        LOG(debug) << "Filtering out event for signal " << stop_event.Signal().siginfo;
+      if (break_status.signal && dbg->is_pass_signal(break_status.signal->si_signo)) {
+        LOG(debug) << "Filtering out event for signal " << break_status.signal->si_signo;
         return false;
       }
 
@@ -1472,6 +1471,7 @@ bool GdbServer::at_target(ReplayResult& result) {
   // group happens to be scheduled here.  We don't take
   // "attach to process" to mean "attach to thread-group
   // leader".
+   std::cout<<"7"<<std::endl;
   return target_event_reached(timeline, target, result) &&
          (!target.pid || t->tgid() == target.pid) &&
          (!target.require_exec || t->execed()) &&
@@ -1755,7 +1755,7 @@ static void push_target_remote_cmd(vector<string>& vec, const string& host,
  */
 static unique_ptr<GdbConnection> await_connection(
     Task* t, ScopedFd& listen_fd, const GdbConnection::Features& features) {
-  auto dbg = unique_ptr<GdbConnection>(new BinConnection(t->tgid(), features));
+  auto dbg = unique_ptr<GdbConnection>(new GdbConnection(t->tgid(), features));
   dbg->set_cpu_features(get_cpu_features(t->arch()));
   dbg->await_debugger(listen_fd);
   return dbg;
@@ -1777,14 +1777,17 @@ static void print_debugger_launch_command(Task* t, const string& host,
 }
 
 void GdbServer::serve_replay(const ConnectionFlags& flags) {
+   std::cout << "10.0" << std::endl;
   ReplayResult result;
   do {
+   std::cout << "10.1" << std::endl;
     result = timeline.replay_step_forward(RUN_CONTINUE);
     if (result.status == REPLAY_EXITED) {
       LOG(info) << "Debugger was not launched before end of trace";
       return;
     }
   } while (!at_target(result));
+   std::cout << "10.2" << std::endl;
 
   unsigned short port = flags.dbg_port > 0 ? flags.dbg_port : getpid();
   // Don't probe if the user specified a port.  Explicitly

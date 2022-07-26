@@ -26,6 +26,8 @@
 #endif
 #endif
 
+#ifndef __BIONIC__
+
 static int (*real_pthread_mutex_init)(void* mutex, const void* attr);
 static int (*real_pthread_mutex_lock)(void* mutex);
 static int (*real_pthread_mutex_trylock)(void* mutex);
@@ -127,6 +129,8 @@ int pthread_mutex_trylock(pthread_mutex_t* mutex) {
   return real_pthread_mutex_trylock(mutex);
 }
 
+#endif
+
 typedef void* Dlopen(const char* filename, int flags);
 
 void* dlopen(const char* filename, int flags) {
@@ -189,6 +193,39 @@ void spurious_desched_syscall(struct syscall_info* info) {
   impose_spurious_desched = 0;
 }
 
+/**
+ * clang's LeakSanitizer has regular threads call sched_yield() in a loop while
+ * a helper thread ptrace-attaches to them. If we let sched_yield() enter the
+ * syscallbuf, the helper thread sees that the regular thread SP register
+ * is pointing to the syscallbuf alt-stack, outside the stack region it
+ * expects, which causes it to freak out.
+ * So, override sched_yield() to perform the syscall in a way that can't
+ * be syscall-buffered.
+ */
+int sched_yield(void) {
+#ifdef __i386__
+  // We have no syscall hook for `syscall` followed by `inc %ecx`
+  int trash;
+  asm volatile ("int $0x80; inc %0" : "=c"(trash) : "a"(SYS_sched_yield));
+#elif defined(__x86_64__)
+  // We have no syscall hook for `syscall` followed by `inc %ecx`
+  int trash;
+  asm volatile ("syscall; inc %0" : "=c"(trash) : "a"(SYS_sched_yield));
+#elif defined(__aarch64__)
+  register long x8 __asm__("x8") = SYS_sched_yield;
+  // We explicitly blacklisted syscall that follows `mov x8, 0xdc`
+  // to avoid patching clone. Abuse that to prevent this from being patched.
+  __asm__ __volatile__("b 1f\n\t"
+                       "mov x8, 0xdc\n"
+                       "1:\n\t"
+                       "svc 0\n"
+                       :: "r"(x8) : "x0", "x30"); // x30 = lr
+#else
+#error "Unknown architecture"
+#endif
+  return 0;
+}
+
 #ifndef __aarch64__
 
 /**
@@ -205,26 +242,11 @@ uid_t geteuid(void) {
 #endif
 }
 
-/**
- * clang's LeakSanitizer has regular threads call sched_yield() in a loop while
- * a helper thread ptrace-attaches to them. If we let sched_yield() enter the
- * syscallbuf, the helper thread sees that the regular thread SP register
- * is pointing to the syscallbuf alt-stack, outside the stack region it
- * expects, which causes it to freak out.
- * So, override sched_yield() to perform the syscall in a way that can't
- * be syscall-buffered. (We have no syscall hook for `syscall` followed by
- * `inc %ecx`).
- */
-int sched_yield(void) {
-  int trash;
-#ifdef __i386__
-  asm volatile ("int $0x80; inc %0" : "=c"(trash) : "a"(SYS_sched_yield));
-#elif defined(__x86_64__)
-  asm volatile ("syscall; inc %0" : "=c"(trash) : "a"(SYS_sched_yield));
-#else
-#error "Unknown architecture"
-#endif
-  return 0;
+static void libstdcpp_not_found(void) {
+  const char msg[] = "[rr] Interposition for libstdc++ called but symbol lookups into libstdc++ failed.\n"
+    "Was libstdc++ loaded with RTLD_LOCAL? Try recording with `-v LD_PRELOAD=libstdc++.so.6`.\n"
+    "About to crash! ";
+  syscall(SYS_write, STDERR_FILENO, msg, sizeof(msg));
 }
 
 /**
@@ -237,10 +259,16 @@ void _ZNSt13random_device7_M_initERKNSt7__cxx1112basic_stringIcSt11char_traitsIc
   if (!assign_string) {
     assign_string = (void (*)(void *, char*))dlsym(RTLD_NEXT,
       "_ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE6assignEPKc");
+    if (!assign_string) {
+      libstdcpp_not_found();
+    }
   }
   assign_string(token, "/dev/urandom");
   if (!random_init) {
     random_init = (void (*)(void *, void*))dlsym(RTLD_NEXT, __func__);
+    if (!random_init) {
+      libstdcpp_not_found();
+    }
   }
   random_init(this, token);
 }
@@ -255,10 +283,16 @@ void _ZNSt13random_device7_M_initERKSs(void* this,
   if (!assign_string) {
     assign_string = (void (*)(void *, char*))dlsym(RTLD_NEXT,
       "_ZNSs6assignEPKc");
+    if (!assign_string) {
+      libstdcpp_not_found();
+    }
   }
   assign_string(token, "/dev/urandom");
   if (!random_init) {
     random_init = (void (*)(void *, void*))dlsym(RTLD_NEXT, __func__);
+    if (!random_init) {
+      libstdcpp_not_found();
+    }
   }
   random_init(this, token);
 }

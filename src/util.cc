@@ -196,6 +196,9 @@ static bool is_start_of_scratch_region(Task* t, remote_ptr<void> start_addr) {
 }
 
 bool probably_not_interactive(int fd) {
+  if (Flags::get().non_interactive) {
+    return true;
+  }
   /* Eminently tunable heuristic, but this is guaranteed to be
    * true during rr unit tests, where we care most about this
    * check (to a first degree).  A failing test shouldn't
@@ -1897,7 +1900,8 @@ int get_num_cpus() {
   return CPU_COUNT(&affinity_mask);
 }
 
-static const uint8_t rdtsc_insn[] = { 0x0f, 0x31 };
+const uint8_t rdtsc_insn[2] = { 0x0f, 0x31 };
+
 static const uint8_t rdtscp_insn[] = { 0x0f, 0x01, 0xf9 };
 static const uint8_t cpuid_insn[] = { 0x0f, 0xa2 };
 static const uint8_t int3_insn[] = { 0xcc };

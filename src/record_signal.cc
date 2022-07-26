@@ -235,13 +235,26 @@ void arm_desched_event(RecordTask* t) {
 
 template <typename Arch>
 static remote_code_ptr get_stub_scratch_1_arch(RecordTask* t) {
-  auto locals = t->read_mem(AddressSpace::preload_thread_locals_start()
-                                .cast<preload_thread_locals<Arch>>());
-  return locals.stub_scratch_1.rptr().as_int();
+  auto remote_locals = AddressSpace::preload_thread_locals_start()
+    .cast<preload_thread_locals<Arch>>();
+  auto remote_stub_scratch_1 = REMOTE_PTR_FIELD(remote_locals, stub_scratch_1);
+  return t->read_mem(remote_stub_scratch_1).rptr().as_int();
 }
 
 static remote_code_ptr get_stub_scratch_1(RecordTask* t) {
   RR_ARCH_FUNCTION(get_stub_scratch_1_arch, t->arch(), t);
+}
+
+template <typename Arch>
+static void get_stub_scratch_2_arch(RecordTask* t, void *buff, size_t sz) {
+  auto remote_locals = AddressSpace::preload_thread_locals_start()
+    .cast<preload_thread_locals<Arch>>();
+  auto remote_stub_scratch_2 = REMOTE_PTR_FIELD(remote_locals, stub_scratch_2);
+  t->read_bytes_helper(remote_stub_scratch_2, sz, buff);
+}
+
+static void get_stub_scratch_2(RecordTask* t, void *buff, size_t sz) {
+  RR_ARCH_FUNCTION(get_stub_scratch_2_arch, t->arch(), t, buff, sz);
 }
 
 /**
@@ -257,10 +270,43 @@ bool handle_syscallbuf_breakpoint(RecordTask* t) {
   if (t->is_at_syscallbuf_final_instruction_breakpoint()) {
     LOG(debug) << "Reached final syscallbuf instruction, singlestepping to "
                   "enable signal dispatch";
-    // This is a single instruction that jumps to the location stored in
-    // preload_thread_locals::stub_scratch_1. Emulate it.
+    // Emulate the effect of the return from syscallbuf.
+    // On x86, this is a single instruction that jumps to the location stored in
+    // preload_thread_locals::stub_scratch_1.
+    // On aarch64, the target of the jump is an instruction that restores
+    // x15 and x30 and then jump back to the syscall.
+    // To minimize the surprise to the tracee if we decide to deliver a signal
+    // we'll emulate the register restore and return directly to the syscall site.
+    // The address in stub_scratch_1 is already the correct address for this.
+    if (t->arch() == aarch64) {
+      uint64_t x15_x30[2];
+      get_stub_scratch_2(t, x15_x30, 16);
+      Registers r = t->regs();
+      r.set_x15(x15_x30[0]);
+      r.set_xlr(x15_x30[1]);
+      t->set_regs(r);
+      t->count_direct_jump();
+    }
     t->emulate_jump(get_stub_scratch_1(t));
 
+    restore_sighandler_if_not_default(t, SIGTRAP);
+    // Now we're back in application code so any pending stashed signals
+    // will be handled.
+    return true;
+  }
+
+  if (t->is_at_syscallstub_exit_breakpoint()) {
+    LOG(debug) << "Reached syscallstub exit instruction, singlestepping to "
+                  "enable signal dispatch";
+    ASSERT(t, t->arch() == aarch64 && t->syscallstub_exit_breakpoint);
+    auto retaddr_addr = t->syscallstub_exit_breakpoint.to_data_ptr<uint8_t>() + 3 * 4;
+    uint64_t retaddr;
+    t->read_bytes_helper(retaddr_addr, sizeof(retaddr), &retaddr);
+    Registers r = t->regs();
+    r.set_ip(retaddr);
+    t->set_regs(r);
+    t->count_direct_jump();
+    t->syscallstub_exit_breakpoint = nullptr;
     restore_sighandler_if_not_default(t, SIGTRAP);
     // Now we're back in application code so any pending stashed signals
     // will be handled.
@@ -411,6 +457,47 @@ static void handle_desched_event(RecordTask* t) {
    * That may be a kernel bug, but we handle it by just
    * continuing until we we continue past the arm-desched
    * syscall *and* stop seeing signals. */
+
+  const auto untraced_record_only_entry =
+    uintptr_t(RR_PAGE_SYSCALL_UNTRACED_RECORDING_ONLY);
+  auto syscall_entry_ip = t->ip().decrement_by_syscall_insn_length(t->arch());
+  if (syscall_entry_ip == remote_code_ptr(untraced_record_only_entry) &&
+      t->regs().syscall_result_signed() == -EFAULT) {
+    intptr_t syscallno;
+    if (t->arch() == aarch64) {
+      // Untraced syscall, we may not have set original_syscallno for this on aarch64.
+      syscallno = t->regs().syscallno();
+    } else {
+      // On x86, syscall no is overwriten by return value.
+      ASSERT(t, is_x86ish(t->arch()));
+      syscallno = t->regs().original_syscallno();
+    }
+    if (syscallno == syscall_number_for_getsockopt(t->arch())) {
+      // We've observed interrupted getsockopt syscalls returning `EFAULT`
+      // rather than the normal ERESTART*.
+      // This is a kernel bug caused by CONFIG_BPFILTER_UMH.
+      // Try to reduce the effect caused by rr generated signals
+      // by manually restarting the syscall
+      // (since the previous syscall returned EFAULT
+      //  we would in the worst case just get another EFAULT).
+      // Note that setting syscall result to ERESTART* wouldn't work on aarch64
+      // if the arg1 has been overwritten by AutoRemoteSyscalls.
+      auto r = t->regs();
+      r.set_ip(syscall_entry_ip);
+      if (t->arch() == aarch64) {
+        // On AArch64, we need to restore arg1 from the stack argument from syscallbuf.
+        auto orig_arg1_ptr = r.sp() + sizeof(long);
+        auto orig_arg1 = t->read_mem(orig_arg1_ptr.cast<long>());
+        r.set_arg1(orig_arg1);
+      } else {
+        ASSERT(t, is_x86ish(t->arch()));
+        // On x86, we need to restore syscall number
+        r.set_syscallno(syscallno);
+      }
+      t->set_regs(r);
+    }
+  }
+
   while (true) {
     // Prevent further desched notifications from firing
     // while we're advancing the tracee.  We're going to
@@ -546,6 +633,11 @@ static bool is_safe_to_deliver_signal(RecordTask* t, siginfo_t* si) {
     return true;
   }
 
+  // Note that this will never fire on aarch64 in a signal stop
+  // since the ip has been moved to the syscall entry.
+  // We will catch it in the traced_syscall_entry case below.
+  // We will miss the exit for rrcall_notify_syscall_hook_exit
+  // but that should not be a big problem.
   if (t->is_in_traced_syscall()) {
     LOG(debug) << "Safe to deliver signal at " << t->ip()
                << " because in traced syscall";
@@ -567,6 +659,8 @@ static bool is_safe_to_deliver_signal(RecordTask* t, siginfo_t* si) {
     return true;
   }
 
+  // On aarch64, the untraced syscall here include both entry and exit
+  // if we are at a signal stop.
   if (t->is_in_untraced_syscall() && t->desched_rec()) {
     // Untraced syscalls always use the architecture of the process
     LOG(debug) << "Safe to deliver signal at " << t->ip()

@@ -136,6 +136,13 @@ static bool looks_like_syscall_entry(RecordTask* t) {
     // there.
     return t->regs().original_syscallno() >= 0 &&
            t->regs().syscall_result_signed() == -ENOSYS;
+  } else if (t->arch() == aarch64) {
+    // We recorded when we saw the last syscall entry
+    // so just use that to determine if we've already save it in the trace.
+    if (t->ticks_at_last_syscall_entry == t->tick_count() &&
+        t->ip_at_last_syscall_entry == t->regs().ip()) {
+      return !t->last_syscall_entry_recorded;
+    }
   }
   // Getting a sched event here is better than a spurious syscall event.
   // Syscall entry does not cause visible register modification, so upon
@@ -171,7 +178,12 @@ static bool handle_ptrace_exit_event(RecordTask* t) {
       // has been updated to reflect syscall entry. If we record a SCHED in
       // that state replay of the SCHED will fail. So detect that state and fix
       // it up.
-      if (looks_like_syscall_entry(t)) {
+      // If we got killed in an untraced syscall on AArch64,
+      // it is difficult/impossible to tell if the value of x0 has been overwritten
+      // with the syscall result/error number
+      // and it's even harder to recover the correct value of x0.
+      // Simply ignore these since we weren't going to record them anyway.
+      if (looks_like_syscall_entry(t) && !t->is_in_untraced_syscall()) {
         // Either we're in a syscall, or we're immediately after a syscall
         // and it exited.
         if (t->ticks_at_last_recorded_syscall_exit == t->tick_count() &&
@@ -184,19 +196,50 @@ static bool handle_ptrace_exit_event(RecordTask* t) {
           // highly improbable.
           // Record the syscall-entry event that we otherwise failed to record.
           t->canonicalize_regs(t->arch());
-          t->apply_syscall_entry_regs();
+          auto r = t->regs();
+          if (t->arch() == aarch64) {
+            // On AArch64, when we get here, there are 3 different cases,
+            // 1. EXIT before we hit the syscall entry stop
+            // 2. EXIT after syscall entry stop but
+            //    before the result (X0) is overwritten
+            // 3. EXIT after syscall entry stop and
+            //    after the result (X0) is overwritten
+            //    (i.e. after the syscall but we got an EXIT
+            //     before the syscall exit stop.)
+
+            // We detect the first case based on `*_at_last_syscall_entry`
+            // set by `apply_syscall_entry_regs` and trust the current values
+            // `x0` and `x8`.
+
+            // For the second and third cases, we rely on the syscall enter stop
+            // to set the orig_arg1 and original_syscallno correctly.
+            if (t->ticks_at_last_syscall_entry == t->tick_count() &&
+                t->ip_at_last_syscall_entry == r.ip()) {
+              // We need to rely on the saved `orig_arg1` since in the third case
+              // the `x0` may already be overwritten.
+              // The assertion here assumes that
+              // `apply_syscall_entry_regs` is called when we enter the syscall
+              // and `x8` still holds the correct syscall number
+              // when we hit the process exit stop.
+              ASSERT(t, r.original_syscallno() == r.syscallno())
+                << "syscallno not saved by syscall enter handler: " << r;
+              r.set_arg1(r.orig_arg1());
+            } else {
+              r.set_original_syscallno(r.syscallno());
+            }
+          }
           // Assume it's a native-arch syscall. If it isn't, it doesn't matter
           // all that much since we aren't actually going to do anything with it
           // in this task.
           // Avoid calling detect_syscall_arch here since it could fail if the
           // task is already completely dead and gone.
-          SyscallEvent event(t->regs().original_syscallno(), t->arch());
+          SyscallEvent event(r.original_syscallno(), t->arch());
           event.state = ENTERING_SYSCALL;
           // Don't try to reset the syscallbuf here. The task may be exiting
           // while in arbitrary syscallbuf code. And of course, because it's
           // exiting, it doesn't matter if we don't reset the syscallbuf.
           t->record_event(event, RecordTask::FLUSH_SYSCALLBUF,
-                          RecordTask::DONT_RESET_SYSCALLBUF);
+                          RecordTask::DONT_RESET_SYSCALLBUF, &r);
         }
       } else {
         // Don't try to reset the syscallbuf here. The task may be exiting
@@ -624,13 +667,16 @@ bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
       }
 
       int seccomp_data = t->get_ptrace_eventmsg_seccomp_data();
+      // We need to set the orig_* values before we let the process continue to exit
+      // since the handler for the exit event will need them.
+      // See `handle_ptrace_exit_event` above.
+      t->apply_syscall_entry_regs();
       if (seccomp_data < 0) {
         // Process just died. Urk. Just wait for the exit event and pretend this stop never happened!
         last_task_switchable = ALLOW_SWITCH;
         step_state->continue_type = DONT_CONTINUE;
         return true;
       }
-      t->apply_syscall_entry_regs();
       int syscallno = t->regs().original_syscallno();
       if (seccomp_data == SECCOMP_RET_DATA) {
         LOG(debug) << "  traced syscall entered: "
@@ -2006,7 +2052,7 @@ bool RecordSession::prepare_to_inject_signal(RecordTask* t,
     // Our synthesized deterministic SIGSYS (seccomp trap) needs to match the
     // kernel behavior of unblocking the signal and resetting disposition to
     // default.
-    t->unblock_signal(SIGSYS);
+    (void)t->unblock_signal(SIGSYS);
     t->set_sig_handler_default(SIGSYS);
   }
   switch (handle_signal(t, &si.linux_api, sig->deterministic, SIG_UNBLOCKED)) {
@@ -2228,7 +2274,8 @@ static string lookup_by_path(const string& name) {
     const TraceUuid* trace_id,
     bool use_audit,
     bool unmap_vdso,
-    bool force_asan_active) {
+    bool force_asan_active,
+    bool force_tsan_active) {
   // The syscallbuf library interposes some critical
   // external symbols like XShmQueryExtension(), so we
   // preload it whether or not syscallbuf is enabled. Indicate here whether
@@ -2284,8 +2331,12 @@ static string lookup_by_path(const string& name) {
     CLEAN_FATAL() << "Provided tracee '" << argv[0] << "' is a directory, not an executable";
   }
   ExeInfo exe_info = read_exe_info(full_path);
-  if (force_asan_active && exe_info.sanitizer_exclude_memory_ranges.empty()) {
-    exe_info.setup_asan_memory_ranges();
+  if (exe_info.sanitizer_exclude_memory_ranges.empty()) {
+    if (force_asan_active) {
+      exe_info.setup_asan_memory_ranges();
+    } else if (force_tsan_active) {
+      exe_info.setup_tsan_memory_ranges();
+    }
   }
 
   // Strip any LD_PRELOAD that an outer rr may have inserted
@@ -2413,7 +2464,7 @@ RecordSession::RecordSession(const std::string& exe_path,
 RecordSession::RecordResult RecordSession::record_step() {
   RecordResult result;
 
-  if (task_map.size() == detached_task_map.size()) {
+  if (task_map.empty()) {
     result.status = STEP_EXITED;
     result.exit_status = initial_thread_group->exit_status;
     return result;

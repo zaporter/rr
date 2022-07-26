@@ -126,7 +126,7 @@ public:
 
   ReplayTimeline& get_timeline() { return timeline; }
 
-protected:
+/* protected: */
   GdbServer(std::unique_ptr<GdbConnection>& dbg, Task* t);
 
   Session& current_session() {

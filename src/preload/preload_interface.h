@@ -51,6 +51,7 @@ static inline size_t rrstrlen(const char* s) { return strlen(s); }
 #endif
 
 #include <stdint.h>
+#include <stddef.h>
 
 static inline int strprefix(const char* s1, const char* s2) {
   while (1) {
@@ -145,7 +146,12 @@ static inline const char* extract_file_name(const char* s) {
 /* PRELOAD_THREAD_LOCALS_ADDR should not change.
  * Tools depend on this address. */
 #define PRELOAD_THREAD_LOCALS_ADDR (RR_PAGE_ADDR + PRELOAD_LIBRARY_PAGE_SIZE)
-#define PRELOAD_THREAD_LOCALS_SIZE 104
+#ifdef __aarch64__
+#define PRELOAD_THREAD_LOCAL_SCRATCH2_SIZE (1024 + 8 * 2)
+#else
+#define PRELOAD_THREAD_LOCAL_SCRATCH2_SIZE 0
+#endif
+#define PRELOAD_THREAD_LOCALS_SIZE (104 + PRELOAD_THREAD_LOCAL_SCRATCH2_SIZE)
 
 #include "rrcalls.h"
 
@@ -369,7 +375,15 @@ struct preload_thread_locals {
   size_t usable_scratch_size;
 
   PTR(struct msghdr) notify_control_msg;
+
+  uint8_t stub_scratch_2[PRELOAD_THREAD_LOCAL_SCRATCH2_SIZE];
 };
+#if defined(__aarch64__) && (defined(RR_IMPLEMENT_PRELOAD) || \
+                             defined(RR_IMPLEMENT_AUDIT))
+// On aarch64, we the stub_scratch_2 offset is hardcoded in the syscallbuf code
+_Static_assert(offsetof(struct preload_thread_locals, stub_scratch_2) == 8 * 13,
+               "stub_scratch_2 offset mismatch");
+#endif
 
 // The set of flags that can be set for each fd in syscallbuf_fds_disabled.
 enum syscallbuf_fd_classes {
@@ -404,7 +418,7 @@ struct rrcall_init_preload_params {
   int syscallbuf_enabled;
   int syscall_patch_hook_count;
   PTR(struct syscall_patch_hook) syscall_patch_hooks;
-  PTR(void) syscallhook_vsyscall_entry;
+  PTR(void) unused;
   PTR(void) syscallbuf_code_start;
   PTR(void) syscallbuf_code_end;
   PTR(void) get_pc_thunks_start;

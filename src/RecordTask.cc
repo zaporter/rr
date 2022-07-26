@@ -191,6 +191,7 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       break_at_syscallbuf_traced_syscalls(false),
       break_at_syscallbuf_untraced_syscalls(false),
       break_at_syscallbuf_final_instruction(false),
+      syscallstub_exit_breakpoint(),
       next_pmc_interrupt_is_for_user(false),
       did_record_robust_futex_changes(false),
       waiting_for_reap(false),
@@ -456,16 +457,30 @@ template <typename Arch> void RecordTask::init_buffers_arch() {
     args.syscallbuf_size = syscallbuf_size = session().syscall_buffer_size();
     KernelMapping syscallbuf_km = init_syscall_buffer(remote, nullptr);
     args.syscallbuf_ptr = syscallbuf_child;
+    if (syscallbuf_child != nullptr) {
+      // This needs to be skipped if we couldn't allocate the buffer
+      // since replaying only reads (and advances) the mmap record
+      // if `args.syscallbuf_ptr != nullptr`.
+      auto record_in_trace = trace_writer().write_mapped_region(
+        this, syscallbuf_km, syscallbuf_km.fake_stat(), syscallbuf_km.fsname(),
+        vector<TraceRemoteFd>(),
+        TraceWriter::RR_BUFFER_MAPPING);
+      ASSERT(this, record_in_trace == TraceWriter::DONT_RECORD_IN_TRACE);
+    } else {
+      // This can fail, e.g. if the tracee died unexpectedly.
+      LOG(debug) << "Syscallbuf initialization failed";
+      args.syscallbuf_size = 0;
+    }
+  } else {
+    args.syscallbuf_ptr = remote_ptr<void>(nullptr);
+    args.syscallbuf_size = 0;
+  }
+
+  if (args.syscallbuf_ptr) {
     desched_fd_child = args.desched_counter_fd;
     // Prevent the child from closing this fd
     fds->add_monitor(this, desched_fd_child, new PreserveFileMonitor());
     desched_fd = remote.retrieve_fd(desched_fd_child);
-
-    auto record_in_trace = trace_writer().write_mapped_region(
-        this, syscallbuf_km, syscallbuf_km.fake_stat(), syscallbuf_km.fsname(),
-        vector<TraceRemoteFd>(),
-        TraceWriter::RR_BUFFER_MAPPING);
-    ASSERT(this, record_in_trace == TraceWriter::DONT_RECORD_IN_TRACE);
 
     if (trace_writer().supports_file_data_cloning() &&
         session().use_read_cloning()) {
@@ -492,9 +507,6 @@ template <typename Arch> void RecordTask::init_buffers_arch() {
         args.cloned_file_data_fd = cloned_file_data_fd_child;
       }
     }
-  } else {
-    args.syscallbuf_ptr = remote_ptr<void>(nullptr);
-    args.syscallbuf_size = 0;
   }
   args.scratch_buf = scratch_ptr;
   args.usable_scratch_size = usable_scratch_size();
@@ -580,7 +592,15 @@ bool RecordTask::is_at_syscallbuf_final_instruction_breakpoint() {
   return i == syscallbuf_code_layout.syscallbuf_final_exit_instruction;
 }
 
-void RecordTask::will_resume_execution(ResumeRequest, WaitRequest,
+bool RecordTask::is_at_syscallstub_exit_breakpoint() {
+  if (!break_at_syscallbuf_final_instruction || !syscallstub_exit_breakpoint) {
+    return false;
+  }
+  auto i = ip().undo_executed_bkpt(arch());
+  return i == syscallstub_exit_breakpoint;
+}
+
+bool RecordTask::will_resume_execution(ResumeRequest, WaitRequest,
                                        TicksRequest ticks_request, int sig) {
   // We may execute user code, which could lead to an RDTSC or grow-map
   // operation which unblocks SIGSEGV, and we'll need to know whether to
@@ -611,7 +631,9 @@ void RecordTask::will_resume_execution(ResumeRequest, WaitRequest,
       // We're injecting a signal, so make sure that signal is unblocked.
       sigset &= ~signal_bit(sig);
     }
-    set_sigmask(sigset);
+    if (!set_sigmask(sigset)) {
+      return false;
+    }
   }
 
   // RESUME_NO_TICKS means that tracee code is not going to run so there's no
@@ -642,8 +664,14 @@ void RecordTask::will_resume_execution(ResumeRequest, WaitRequest,
       vm()->add_breakpoint(
           syscallbuf_code_layout.syscallbuf_final_exit_instruction,
           BKPT_INTERNAL);
+      auto stub_bp = as->monkeypatcher().get_jump_stub_exit_breakpoint(ip(), this);
+      if (stub_bp) {
+        syscallstub_exit_breakpoint = stub_bp;
+        vm()->add_breakpoint(stub_bp, BKPT_INTERNAL);
+      }
     }
   }
+  return true;
 }
 
 vector<remote_code_ptr> RecordTask::syscallbuf_syscall_entry_breakpoints() {
@@ -672,6 +700,9 @@ void RecordTask::did_wait() {
     vm()->remove_breakpoint(
         syscallbuf_code_layout.syscallbuf_final_exit_instruction,
         BKPT_INTERNAL);
+  }
+  if (syscallstub_exit_breakpoint) {
+    vm()->remove_breakpoint(syscallstub_exit_breakpoint, BKPT_INTERNAL);
   }
 
   if (stashed_signals_blocking_more_signals) {
@@ -1242,18 +1273,25 @@ sig_set_t RecordTask::get_sigmask() {
   return blocked_sigs;
 }
 
-void RecordTask::unblock_signal(int sig) {
+bool RecordTask::unblock_signal(int sig) {
   sig_set_t mask = get_sigmask();
   mask &= ~signal_bit(sig);
-  set_sigmask(mask);
+  if (!set_sigmask(mask)) {
+    return false;
+  }
   invalidate_sigmask();
+  return true;
 }
 
-void RecordTask::set_sigmask(sig_set_t mask) {
+bool RecordTask::set_sigmask(sig_set_t mask) {
   int ret = fallible_ptrace(PTRACE_SETSIGMASK, remote_ptr<void>(8), &mask);
   if (ret < 0) {
     if (errno == EIO) {
       FATAL() << "PTRACE_SETSIGMASK not supported; rr requires Linux kernel >= 3.11";
+    }
+    if (errno == ESRCH) {
+      // Task most likely died while we at the ptrace stop.
+      return false;
     }
     ASSERT(this, errno == EINVAL);
   } else {
@@ -1261,6 +1299,7 @@ void RecordTask::set_sigmask(sig_set_t mask) {
                << "SYSCALLBUF_DESCHED_SIGNAL/TIME_SLICE_SIGNAL) while we "
                << " have a stashed signal";
   }
+  return true;
 }
 
 void RecordTask::set_sig_handler_default(int sig) {
@@ -1364,6 +1403,7 @@ void RecordTask::stash_sig() {
       break_at_syscallbuf_final_instruction =
           break_at_syscallbuf_traced_syscalls =
               break_at_syscallbuf_untraced_syscalls = true;
+  syscallstub_exit_breakpoint = nullptr;
 }
 
 void RecordTask::stash_synthetic_sig(const siginfo_t& si,
@@ -1395,6 +1435,7 @@ void RecordTask::stash_synthetic_sig(const siginfo_t& si,
       break_at_syscallbuf_final_instruction =
           break_at_syscallbuf_traced_syscalls =
               break_at_syscallbuf_untraced_syscalls = true;
+  syscallstub_exit_breakpoint = nullptr;
 }
 
 bool RecordTask::has_stashed_sig(int sig) const {
@@ -1429,6 +1470,7 @@ void RecordTask::stashed_signal_processed() {
   break_at_syscallbuf_final_instruction = break_at_syscallbuf_traced_syscalls =
       break_at_syscallbuf_untraced_syscalls =
           stashed_signals_blocking_more_signals = has_stashed_sig();
+  syscallstub_exit_breakpoint = nullptr;
 }
 
 const RecordTask::StashedSignal* RecordTask::peek_stashed_sig_to_deliver()
@@ -1538,7 +1580,7 @@ bool RecordTask::is_in_syscallbuf() {
       p = addr;
     }
   }
-  return as->monkeypatcher().is_jump_stub_instruction(p) ||
+  return as->monkeypatcher().is_jump_stub_instruction(p, false) ||
          (syscallbuf_code_layout.syscallbuf_code_start <= p &&
           p < syscallbuf_code_layout.syscallbuf_code_end);
 }
@@ -1856,9 +1898,27 @@ void RecordTask::record_event(const Event& ev, FlushSyscallbuf flush,
     }
   }
 
-  if (ev.is_syscall_event() && ev.Syscall().state == EXITING_SYSCALL) {
-    ticks_at_last_recorded_syscall_exit = tick_count();
-    ip_at_last_recorded_syscall_exit = registers->ip();
+  if (ev.is_syscall_event()) {
+    auto state = ev.Syscall().state;
+    if (state == EXITING_SYSCALL) {
+      ticks_at_last_recorded_syscall_exit = tick_count();
+      ip_at_last_recorded_syscall_exit = registers->ip();
+      if (ticks_at_last_recorded_syscall_exit == ticks_at_last_syscall_entry &&
+          ip_at_last_recorded_syscall_exit == ip_at_last_syscall_entry) {
+        // We've done processing this syscall so we can forget about the entry now
+        // This makes sure that any restarted syscalls would not be treated
+        // as the same entry.
+        ticks_at_last_syscall_entry = 0;
+        ip_at_last_syscall_entry = nullptr;
+        last_syscall_entry_recorded = false;
+      }
+    } else if (state == ENTERING_SYSCALL || state == ENTERING_SYSCALL_PTRACE) {
+      if (tick_count() == ticks_at_last_syscall_entry &&
+          registers->ip() == ip_at_last_syscall_entry) {
+        // Let the process handler know that we've recorded the entry already
+        last_syscall_entry_recorded = true;
+      }
+    }
   }
 
   remote_code_ptr rseq_new_ip = ip();
