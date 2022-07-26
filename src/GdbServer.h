@@ -16,7 +16,6 @@
 #include "ThreadDb.h"
 #endif
 #include "TraceFrame.h"
-#include "BinConnection.h"
 
 namespace rr {
 

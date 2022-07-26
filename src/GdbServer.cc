@@ -1471,7 +1471,6 @@ bool GdbServer::at_target(ReplayResult& result) {
   // group happens to be scheduled here.  We don't take
   // "attach to process" to mean "attach to thread-group
   // leader".
-   std::cout<<"7"<<std::endl;
   return target_event_reached(timeline, target, result) &&
          (!target.pid || t->tgid() == target.pid) &&
          (!target.require_exec || t->execed()) &&

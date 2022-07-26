@@ -110,10 +110,11 @@ set(RR_FLAGS ${RR_FLAGS_RELEASE})
 # Now override for build type.
 string(TOLOWER ${CMAKE_BUILD_TYPE} LOWERCASE_CMAKE_BUILD_TYPE)
 if(LOWERCASE_CMAKE_BUILD_TYPE STREQUAL "debug")
-  set(PRELOAD_COMPILE_FLAGS "${PRELOAD_COMPILE_FLAGS} -O2 -Werror")
-  set(BROTLI_COMPILE_FLAGS "${RR_FLAGS_RELEASE} -O2")
-  set(RR_TEST_FLAGS "${RR_TEST_FLAGS} -Werror")
-  set(RR_FLAGS "${RR_FLAGS_DEBUG} -g3 -Werror")
+  # set(PRELOAD_COMPILE_FLAGS "${PRELOAD_COMPILE_FLAGS} -O2 -Werror")
+  # set(BROTLI_COMPILE_FLAGS "${RR_FLAGS_RELEASE} -O2")
+  # set(RR_TEST_FLAGS "${RR_TEST_FLAGS} -Werror")
+  # set(RR_FLAGS "${RR_FLAGS_DEBUG} -g3 -Werror")
+  set(RR_FLAGS "${RR_FLAGS_RELEASE} -g3 -flto")
 elseif(LOWERCASE_CMAKE_BUILD_TYPE STREQUAL "release")
   # CMake itself will add optimization flags
   set(RR_FLAGS "${RR_FLAGS_RELEASE} -g3 -flto")
@@ -587,7 +588,7 @@ set(RR_SOURCES
   src/util.cc
   src/WaitStatus.cc
   src/foo.cc
-  src/BinConnection.cc
+  src/BinaryInterface.cc
   src/main.cc
   ${CMAKE_CURRENT_BINARY_DIR}/rr_trace.capnp.c++
   ${BLAKE_ARCH_DIR}/blake2b.c
