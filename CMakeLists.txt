@@ -587,7 +587,6 @@ set(RR_SOURCES
   src/VirtualPerfCounterMonitor.cc
   src/util.cc
   src/WaitStatus.cc
-  src/foo.cc
   src/BinaryInterface.cc
   src/main.cc
   ${CMAKE_CURRENT_BINARY_DIR}/rr_trace.capnp.c++
