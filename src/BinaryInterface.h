@@ -51,7 +51,7 @@ public:
   virtual ~BinaryInterface() {};
   /* ReportState state; */
   /* /1* bool set_query_thread(GdbThreadId); *1/ */
-  /* GdbThreadId get_current_thread() const; */
+  GdbThreadId get_current_thread() const;
 /* rust::String get_exec_file(GdbThreadId request_target) const; */
   /* /1* const std::vector<uint8_t>& get_auxv(); *1/ */
   /* /1* const std::string& get_exec_file(); *1/ */
@@ -66,7 +66,7 @@ public:
   /* rust::Vec<GdbRegisterValue> get_regs(pid_t tid) const; */
   /* /1* bool set_reg(); *1/ */
   /* /1* int get_stop_reason(); // todo @ zack multivariate *1/ */
-  /* rust::Vec<GdbThreadId> get_thread_list() const; */
+  std::vector<GdbThreadId> get_thread_list() const;
   /* /1* bool watchpoint_request(); *1/ */
   /* /1* detach(); *1/ */ 
   /* /1* const std::vector<uint8_t>& read_siginfo(); *1/ */

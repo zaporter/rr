@@ -1,52 +1,106 @@
 #include "BinaryInterface.h"
-#include <iostream>
-#include <memory>
-#include <unistd.h>
-#include "util.h"
-#include "core.h"
+/* #include <iostream> */
+/* #include <memory> */
+/* #include <unistd.h> */
+/* #include "util.h" */
+/* #include "core.h" */
+/* #include "main.h" */
+
+
+
+/* #include "Command.h" */
+/* #include "Flags.h" */
+/* #include "GdbServer.h" */
+/* #include "ReplaySession.h" */
+/* #include "core.h" */
+/* #include <memory> */
+/* #include <unistd.h> */
+
+
+
+/* #include <sys/prctl.h> */
+/* #include <sys/time.h> */
+/* #include <sys/wait.h> */
+/* #include <unistd.h> */
+
+/* #include <limits> */
+/* #include <iostream> */
+
+/* #include "Command.h" */
+/* #include "GdbServer.h" */
+/* #include "ReplaySession.h" */
+/* #include "ScopedFd.h" */
+/* #include "kernel_metadata.h" */
+/* #include "log.h" */
 #include "main.h"
 
-
-
-#include "Command.h"
-#include "Flags.h"
-#include "GdbServer.h"
-#include "ReplaySession.h"
-#include "core.h"
-#include <memory>
-#include <unistd.h>
-
-
-
-#include <sys/prctl.h>
-#include <sys/time.h>
+#include <elf.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <limits>
-#include <iostream>
+#include <map>
+#include <sstream>
+#include <string>
+#include <vector>
 
-#include "Command.h"
-#include "GdbServer.h"
+#include "BreakpointCondition.h"
+#include "ElfReader.h"
+#include "Event.h"
+#include "GdbCommandHandler.h"
+#include "GdbExpression.h"
 #include "ReplaySession.h"
+#include "ReplayTask.h"
 #include "ScopedFd.h"
+#include "StringVectorToCharArray.h"
+#include "Task.h"
+#include "ThreadGroup.h"
+#include "core.h"
 #include "kernel_metadata.h"
 #include "log.h"
-#include "main.h"
-
+#include "util.h"
 
 using namespace std;
 
 namespace rr {
-/* static size_t get_reg(const Registers& regs, const ExtraRegisters& extra_regs, */
-/*                       uint8_t* buf, GdbRegister regname, bool* defined) { */
-/*   size_t num_bytes = regs.read_register(buf, regname, defined); */
-/*   if (!*defined) { */
-/*     num_bytes = extra_regs.read_register(buf, regname, defined); */
-/*   } */
-/*   return num_bytes; */
-/* } */
+// ------------------------------------------------
+// BEGIN PASTE FROM GdbServer.cc
+// -----------------------------------------------
+//
+static size_t get_reg(const Registers& regs, const ExtraRegisters& extra_regs,
+                      uint8_t* buf, GdbRegister regname, bool* defined) {
+  size_t num_bytes = regs.read_register(buf, regname, defined);
+  if (!*defined) {
+    num_bytes = extra_regs.read_register(buf, regname, defined);
+  }
+  return num_bytes;
+}
 
+static bool set_reg(Task* target, const GdbRegisterValue& reg) {
+  if (!reg.defined) {
+    return false;
+  }
+
+  Registers regs = target->regs();
+  if (regs.write_register(reg.name, reg.value, reg.size)) {
+    target->set_regs(regs);
+    return true;
+  }
+
+  ExtraRegisters extra_regs = target->extra_regs();
+  if (extra_regs.write_register(reg.name, reg.value, reg.size)) {
+    target->set_extra_regs(extra_regs);
+    return true;
+  }
+
+  LOG(warn) << "Unhandled register name " << reg.name;
+  return false;
+}
 static bool pid_exists(const string& trace_dir, pid_t pid) {
   TraceReader trace(trace_dir);
 
@@ -98,87 +152,330 @@ static int find_pid_for_command(const string& trace_dir,
     }
   }
 }
-/* static bool set_reg(Task* target, const GdbRegisterValue& reg) { */
-/*   if (!reg.defined) { */
-/*     return false; */
-/*   } */
 
-/*   Registers regs = target->regs(); */
-/*   if (regs.write_register(reg.name, reg.value, reg.size)) { */
-/*     target->set_regs(regs); */
-/*     return true; */
-/*   } */
+static GdbThreadId get_threadid(const Session& session, const TaskUid& tuid) {
+  Task* t = session.find_task(tuid);
+  pid_t pid = t ? t->tgid() : GdbThreadId::ANY.pid;
+  return GdbThreadId(pid, tuid.tid());
+}
 
-/*   ExtraRegisters extra_regs = target->extra_regs(); */
-/*   if (extra_regs.write_register(reg.name, reg.value, reg.size)) { */
-/*     target->set_extra_regs(extra_regs); */
-/*     return true; */
-/*   } */
+static GdbThreadId get_threadid(Task* t) {
+  return GdbThreadId(t->tgid(), t->rec_tid);
+}
 
-/*   LOG(warn) << "Unhandled register name " << reg.name; */
-/*   return false; */
-/* } */
-/* static GdbThreadId get_threadid(const Session& session, const TaskUid& tuid) { */
-/*   Task* t = session.find_task(tuid); */
-/*   pid_t pid = t ? t->tgid() : GdbThreadId::ANY.pid; */
-/*   return GdbThreadId(pid, tuid.tid()); */
-/* } */
 
-/* static GdbThreadId get_threadid(Task* t) { */
-/*   return GdbThreadId(t->tgid(), t->rec_tid); */
-/* } */
 
-/* static bool matches_threadid(const GdbThreadId& tid, */
-/*                              const GdbThreadId& target) { */
-/*   return (target.pid <= 0 || target.pid == tid.pid) && */
-/*          (target.tid <= 0 || target.tid == tid.tid); */
-/* } */
+static bool matches_threadid(const GdbThreadId& tid,
+                             const GdbThreadId& target) {
+  return (target.pid <= 0 || target.pid == tid.pid) &&
+         (target.tid <= 0 || target.tid == tid.tid);
+}
 
-/* static bool matches_threadid(Task* t, const GdbThreadId& target) { */
-/*   GdbThreadId tid = get_threadid(t); */
-/*   return matches_threadid(tid, target); */
-/* } */
+static bool matches_threadid(Task* t, const GdbThreadId& target) {
+  GdbThreadId tid = get_threadid(t);
+  return matches_threadid(tid, target);
+}
 
-/* static WatchType watchpoint_type(GdbRequestType req) { */
-/*   switch (req) { */
-/*     case DREQ_SET_HW_BREAK: */
-/*     case DREQ_REMOVE_HW_BREAK: */
-/*       return WATCH_EXEC; */
-/*     case DREQ_SET_WR_WATCH: */
-/*     case DREQ_REMOVE_WR_WATCH: */
-/*       return WATCH_WRITE; */
-/*     case DREQ_REMOVE_RDWR_WATCH: */
-/*     case DREQ_SET_RDWR_WATCH: */
-/*     // NB: x86 doesn't support read-only watchpoints (who would */
-/*     // ever want to use one?) so we treat them as readwrite */
-/*     // watchpoints and hope that gdb can figure out what's going */
-/*     // on.  That is, if a user ever tries to set a read */
-/*     // watchpoint. */
-/*     case DREQ_REMOVE_RD_WATCH: */
-/*     case DREQ_SET_RD_WATCH: */
-/*       return WATCH_READWRITE; */
-/*     default: */
-/*       FATAL() << "Unknown dbg request " << req; */
-/*       return WatchType(-1); // not reached */
-/*   } */
-/* } */
+static WatchType watchpoint_type(GdbRequestType req) {
+  switch (req) {
+    case DREQ_SET_HW_BREAK:
+    case DREQ_REMOVE_HW_BREAK:
+      return WATCH_EXEC;
+    case DREQ_SET_WR_WATCH:
+    case DREQ_REMOVE_WR_WATCH:
+      return WATCH_WRITE;
+    case DREQ_REMOVE_RDWR_WATCH:
+    case DREQ_SET_RDWR_WATCH:
+    // NB: x86 doesn't support read-only watchpoints (who would
+    // ever want to use one?) so we treat them as readwrite
+    // watchpoints and hope that gdb can figure out what's going
+    // on.  That is, if a user ever tries to set a read
+    // watchpoint.
+    case DREQ_REMOVE_RD_WATCH:
+    case DREQ_SET_RD_WATCH:
+      return WATCH_READWRITE;
+    default:
+      FATAL() << "Unknown dbg request " << req;
+      return WatchType(-1); // not reached
+  }
+}
 
-/* static void maybe_singlestep_for_event(Task* t, GdbRequest* req) { */
-/*   if (!t->session().is_replaying()) { */
-/*     return; */
-/*   } */
-/*   auto rt = static_cast<ReplayTask*>(t); */
-/*   if (trace_instructions_up_to_event( */
-/*           rt->session().current_trace_frame().time())) { */
-/*     fputs("Stepping: ", stderr); */
-/*     t->regs().print_register_file_compact(stderr); */
-/*     fprintf(stderr, " ticks:%" PRId64 "\n", t->tick_count()); */
-/*     *req = GdbRequest(DREQ_CONT); */
-/*     req->suppress_debugger_stop = true; */
-/*     req->cont().actions.push_back( */
-/*         GdbContAction(ACTION_STEP, get_threadid(t->session(), t->tuid()))); */
-/*   } */
-/* } */
+static void maybe_singlestep_for_event(Task* t, GdbRequest* req) {
+  if (!t->session().is_replaying()) {
+    return;
+  }
+  auto rt = static_cast<ReplayTask*>(t);
+  if (trace_instructions_up_to_event(
+          rt->session().current_trace_frame().time())) {
+    fputs("Stepping: ", stderr);
+    t->regs().print_register_file_compact(stderr);
+    fprintf(stderr, " ticks:%" PRId64 "\n", t->tick_count());
+    *req = GdbRequest(DREQ_CONT);
+    req->suppress_debugger_stop = true;
+    req->cont().actions.push_back(
+        GdbContAction(ACTION_STEP, get_threadid(t->session(), t->tuid())));
+  }
+}
+
+
+static bool search_memory(Task* t, const MemoryRange& where,
+                          const vector<uint8_t>& find,
+                          remote_ptr<void>* result) {
+  vector<uint8_t> buf;
+  buf.resize(page_size() + find.size() - 1);
+  for (const auto& m : t->vm()->maps()) {
+    MemoryRange r = MemoryRange(m.map.start(), m.map.end() + find.size() - 1)
+                        .intersect(where);
+    // We basically read page by page here, but we read past the end of the
+    // page to handle the case where a found string crosses page boundaries.
+    // This approach isn't great for handling long search strings but gdb's find
+    // command isn't really suited to that.
+    // Reading page by page lets us avoid problems where some pages in a
+    // mapping aren't readable (e.g. reading beyond end of file).
+    while (r.size() >= find.size()) {
+      ssize_t nread = t->read_bytes_fallible(
+          r.start(), std::min(buf.size(), r.size()), buf.data());
+      if (nread >= ssize_t(find.size())) {
+        void* found = memmem(buf.data(), nread, find.data(), find.size());
+        if (found) {
+          *result = r.start() + (static_cast<uint8_t*>(found) - buf.data());
+          return true;
+        }
+      }
+      r = MemoryRange(
+          std::min(r.end(), floor_page_size(r.start()) + page_size()), r.end());
+    }
+  }
+  return false;
+}
+
+static bool is_in_patch_stubs(Task* t, remote_code_ptr ip) {
+  auto p = ip.to_data_ptr<void>();
+  return t->vm()->has_mapping(p) &&
+         (t->vm()->mapping_flags_of(p) & AddressSpace::Mapping::IS_PATCH_STUBS);
+}
+
+static bool any_action_targets_match(const Session& session,
+                                     const TaskUid& tuid,
+                                     const vector<GdbContAction>& actions) {
+  GdbThreadId tid = get_threadid(session, tuid);
+  return any_of(actions.begin(), actions.end(), [tid](GdbContAction action) {
+    return matches_threadid(tid, action.target);
+  });
+}
+
+static Task* find_first_task_matching_target(
+    const Session& session, const vector<GdbContAction>& actions) {
+  const Session::TaskMap& tasks = session.tasks();
+  auto it = find_first_of(
+      tasks.begin(), tasks.end(),
+      actions.begin(), actions.end(),
+      [](Session::TaskMap::value_type task_pair, GdbContAction action) {
+        return matches_threadid(task_pair.second, action.target);
+      });
+  return it != tasks.end() ? it->second : nullptr;
+}
+
+static bool is_last_thread_exit(const BreakStatus& break_status) {
+  // The task set may be empty if the task has already exited.
+  return break_status.task_exit &&
+         break_status.task_context.thread_group->task_set().size() <= 1;
+}
+
+static Task* is_in_exec(ReplayTimeline& timeline) {
+  Task* t = timeline.current_session().current_task();
+  if (!t) {
+    return nullptr;
+  }
+  return timeline.current_session().next_step_is_successful_exec_syscall_exit()
+             ? t
+             : nullptr;
+}
+
+static bool target_event_reached(const ReplayTimeline& timeline, const GdbServer::Target& target, const ReplayResult& result) {
+  if (target.event == -1) {
+    return is_last_thread_exit(result.break_status) &&
+      (target.pid <= 0 || result.break_status.task_context.thread_group->tgid == target.pid);
+  } else {
+    return timeline.current_session().current_trace_frame().time() > target.event;
+  }
+}
+
+static uint32_t get_cpu_features(SupportedArch arch) {
+  uint32_t cpu_features;
+  switch (arch) {
+    case x86:
+    case x86_64: {
+      cpu_features = arch == x86_64 ? GdbConnection::CPU_X86_64 : 0;
+      unsigned int AVX_cpuid_flags = AVX_FEATURE_FLAG | OSXSAVE_FEATURE_FLAG;
+      auto cpuid_data = cpuid(CPUID_GETEXTENDEDFEATURES, 0);
+      if ((cpuid_data.ecx & PKU_FEATURE_FLAG) == PKU_FEATURE_FLAG) {
+        // PKU (Skylake) implies AVX (Sandy Bridge).
+        cpu_features |= GdbConnection::CPU_AVX | GdbConnection::CPU_PKU;
+        break;
+      }
+
+      cpuid_data = cpuid(CPUID_GETFEATURES, 0);
+      // We're assuming here that AVX support on the system making the recording
+      // is the same as the AVX support during replay. But if that's not true,
+      // rr is totally broken anyway.
+      if ((cpuid_data.ecx & AVX_cpuid_flags) == AVX_cpuid_flags) {
+        cpu_features |= GdbConnection::CPU_AVX;
+      }
+      break;
+    }
+    case aarch64:
+      cpu_features = GdbConnection::CPU_AARCH64;
+      break;
+    default:
+      FATAL() << "Unknown architecture";
+      return 0;
+  }
+
+  return cpu_features;
+}
+
+static string to_string(const vector<string>& args) {
+  stringstream ss;
+  for (auto& a : args) {
+    ss << "'" << a << "' ";
+  }
+  return ss.str();
+}
+
+static bool needs_target(const string& option) {
+  return !strncmp(option.c_str(), "continue", option.size());
+}
+
+static ScopedFd generate_fake_proc_maps(Task* t) {
+  TempFile file = create_temporary_file("rr-fake-proc-maps-XXXXXX");
+  unlink(file.name.c_str());
+
+  int fd = dup(file.fd);
+  if (fd < 0) {
+    FATAL() << "Cannot dup";
+  }
+  FILE* f = fdopen(fd, "w");
+
+
+  int addr_min_width = word_size(t->arch()) == 8 ? 10 : 8;
+  for (AddressSpace::Maps::iterator it = t->vm()->maps().begin();
+       it != t->vm()->maps().end(); ++it) {
+    // If this is the mapping just before the rr page and it's still librrpage,
+    // merge this mapping with the subsequent one. We'd like gdb to treat
+    // librrpage as the vdso, but it'll only do so if the entire vdso is one
+    // mapping.
+    auto m = *it;
+    uintptr_t map_end = (long long)m.recorded_map.end().as_int();
+    if (m.recorded_map.end() == t->vm()->rr_page_start()) {
+      auto it2 = it;
+      if (++it2 != t->vm()->maps().end()) {
+        auto m2 = *it2;
+        if (m2.flags & AddressSpace::Mapping::IS_RR_PAGE) {
+          // Extend this mapping
+          map_end += PRELOAD_LIBRARY_PAGE_SIZE;
+          // Skip the rr page
+          ++it;
+        }
+      }
+    }
+
+    int len =
+        fprintf(f, "%0*llx-%0*llx %s%s%s%s %08llx %02x:%02x %lld",
+                addr_min_width, (long long)m.recorded_map.start().as_int(),
+                addr_min_width, (long long)map_end,
+                (m.recorded_map.prot() & PROT_READ) ? "r" : "-",
+                (m.recorded_map.prot() & PROT_WRITE) ? "w" : "-",
+                (m.recorded_map.prot() & PROT_EXEC) ? "x" : "-",
+                (m.recorded_map.flags() & MAP_SHARED) ? "s" : "p",
+                (long long)m.recorded_map.file_offset_bytes(),
+                major(m.recorded_map.device()), minor(m.recorded_map.device()),
+                (long long)m.recorded_map.inode());
+    while (len < 72) {
+      fputc(' ', f);
+      ++len;
+    }
+    fputc(' ', f);
+
+    string name;
+    const string& fsname = m.recorded_map.fsname();
+    for (size_t i = 0; i < fsname.size(); ++i) {
+      if (fsname[i] == '\n') {
+        name.append("\\012");
+      } else {
+        name.push_back(fsname[i]);
+      }
+    }
+    fputs(name.c_str(), f);
+    fputc('\n', f);
+  }
+  if (ferror(f) || fclose(f)) {
+    FATAL() << "Can't write";
+  }
+
+  return move(file.fd);
+}
+
+static bool is_ld_mapping(string map_name) {
+  char ld_start[] = "ld-";
+  size_t matchpos = map_name.find_last_of('/');
+  string fname = map_name.substr(matchpos == string::npos ? 0 : matchpos + 1);
+  return memcmp(fname.c_str(), ld_start,
+                sizeof(ld_start)-1) == 0;
+}
+
+static bool is_likely_interp(string fsname) {
+#ifdef __aarch64__
+  return fsname == "/lib/ld-linux-aarch64.so.1";
+#else
+  return fsname == "/lib64/ld-linux-x86-64.so.2" || fsname == "/lib/ld-linux.so.2";
+#endif
+}
+
+static remote_ptr<void> base_addr_from_rendezvous(Task* t, string fname)
+{
+  remote_ptr<void> interpreter_base = t->vm()->saved_interpreter_base();
+  if (!interpreter_base || !t->vm()->has_mapping(interpreter_base)) {
+    return nullptr;
+  }
+  string ld_path = t->vm()->saved_ld_path();
+  if (ld_path.length() == 0) {
+    FATAL() << "Failed to retrieve interpreter name with interpreter_base=" << interpreter_base;
+  }
+  ScopedFd ld(ld_path.c_str(), O_RDONLY);
+  if (ld < 0) {
+    FATAL() << "Open failed: " << ld_path;
+  }
+  ElfFileReader reader(ld);
+  auto syms = reader.read_symbols(".dynsym", ".dynstr");
+  static const char r_debug[] = "_r_debug";
+  bool found = false;
+  uintptr_t r_debug_offset = 0;
+  for (size_t i = 0; i < syms.size(); ++i) {
+    if (!syms.is_name(i, r_debug)) {
+      continue;
+    }
+    r_debug_offset = syms.addr(i);
+    found = true;
+  }
+  if (!found) {
+    return nullptr;
+  }
+  bool ok = true;
+  remote_ptr<NativeArch::r_debug> r_debug_remote = interpreter_base.as_int()+r_debug_offset;
+  remote_ptr<NativeArch::link_map> link_map = t->read_mem(REMOTE_PTR_FIELD(r_debug_remote, r_map), &ok);
+  while (ok && link_map != nullptr) {
+    if (fname == t->read_c_str(t->read_mem(REMOTE_PTR_FIELD(link_map, l_name), &ok), &ok)) {
+      remote_ptr<void> result = t->read_mem(REMOTE_PTR_FIELD(link_map, l_addr), &ok);
+      return ok ? result : nullptr;
+    }
+    link_map = t->read_mem(REMOTE_PTR_FIELD(link_map, l_next), &ok);
+  }
+  return nullptr;
+}
+// ------------------------------------------------------
+// END PASTE FROM GdbServer.cc
+// ------------------------------------------------------
 
 int64_t BinaryInterface::current_frame_time() const {
   return s.timeline.current_session().current_frame_time();
@@ -242,21 +539,22 @@ bool BinaryInterface::initialize(){
 
   /* LOG(debug) << "debugger server exiting ..."; */
 
-/* GdbThreadId BinaryInterface::get_current_thread() const{ */
-/*     BinaryInterface* me = const_cast<BinaryInterface*>(this); */
-/*     return get_threadid(me->current_session(), last_continue_tuid); */
-/* } */
-/* rust::Vec<GdbThreadId> BinaryInterface::get_thread_list() const{ */
-/*     BinaryInterface* me = const_cast<BinaryInterface*>(this); */
-/*     rust::Vec<GdbThreadId> tids; */
-/*     if (state != REPORT_THREADS_DEAD) { */
-/*       for (auto& kv : me->current_session().tasks()) { */
-/*         tids.push_back(get_threadid(me->current_session(), kv.second->tuid())); */
-/*       } */
-/*     } */
-/*     return tids; */
+GdbThreadId BinaryInterface::get_current_thread() const{
+    BinaryInterface* me = const_cast<BinaryInterface*>(this);
+    return get_threadid(me->s.current_session(), me->s.last_continue_tuid);
+}
 
-/* } */
+std::vector<GdbThreadId> BinaryInterface::get_thread_list() const{
+    BinaryInterface* me = const_cast<BinaryInterface*>(this);
+    vector<GdbThreadId> tids;
+    /* if (state != REPORT_THREADS_DEAD) { */
+      for (auto& kv : me->s.current_session().tasks()) {
+        tids.push_back(get_threadid(me->s.current_session(), kv.second->tuid()));
+      }
+    /* } */
+    return tids;
+
+}
 /* rust::String BinaryInterface::get_exec_file(GdbThreadId request_target) const { */
 
 /*     string exec_file; */

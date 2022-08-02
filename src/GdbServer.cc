@@ -206,6 +206,7 @@ GdbRegisterValue GdbServer::get_reg(const Registers& regs,
   return reg;
 }
 
+
 static GdbThreadId get_threadid(const Session& session, const TaskUid& tuid) {
   Task* t = session.find_task(tuid);
   pid_t pid = t ? t->tgid() : GdbThreadId::ANY.pid;
@@ -215,7 +216,6 @@ static GdbThreadId get_threadid(const Session& session, const TaskUid& tuid) {
 static GdbThreadId get_threadid(Task* t) {
   return GdbThreadId(t->tgid(), t->rec_tid);
 }
-
 static bool matches_threadid(const GdbThreadId& tid,
                              const GdbThreadId& target) {
   return (target.pid <= 0 || target.pid == tid.pid) &&
