@@ -481,6 +481,8 @@ int64_t BinaryInterface::current_frame_time() const {
   return s.timeline.current_session().current_frame_time();
 }
 
+
+
 bool BinaryInterface::initialize(){
   ReplayResult result;
   int i = 0;
@@ -492,7 +494,6 @@ bool BinaryInterface::initialize(){
       return false;
     }
   } while (!s.at_target(result));
-  cout << "Did " << i << "iterations" << endl; 
   return true;
 }
   /* Task* t = timeline.current_session().current_task(); */
