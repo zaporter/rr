@@ -150,7 +150,7 @@ public:
   bool at_target(ReplayResult& result);
   void activate_debugger();
   void restart_session(const GdbRequest& req);
-  GdbRequest process_debugger_requests(ReportState state = REPORT_NORMAL);
+  virtual GdbRequest process_debugger_requests(ReportState state = REPORT_NORMAL);
   enum ContinueOrStop { CONTINUE_DEBUGGING, STOP_DEBUGGING };
   bool detach_or_restart(const GdbRequest& req, ContinueOrStop* s);
   ContinueOrStop handle_exited_state(GdbRequest& last_resume_request);

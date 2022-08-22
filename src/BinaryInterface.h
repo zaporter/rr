@@ -22,6 +22,7 @@
 #include "core.h"
 #include <memory>
 #include <unistd.h>
+#include <vector>
 namespace rr {
 
 
@@ -30,10 +31,10 @@ namespace rr {
  * Sadly that functionality is exposed only though a message passing API so 
  * this class creates and passes message to a tricked GdbServer.
  */
-class BinaryInterface  {
+class BinaryInterface  : public GdbServer {
 public: 
   BinaryInterface(std::shared_ptr<ReplaySession> session, const GdbServer::Target& target)
-    : s(session, target)
+    : GdbServer(session, target)
     /*GdbServer( session, target), state(REPORT_NORMAL)*/
   {
 
@@ -42,7 +43,6 @@ public:
       /* s.serve_replay(conn_flags); */
   };
 
-  GdbServer s;
   bool initialize();
   int64_t current_frame_time() const;
 
@@ -52,17 +52,28 @@ public:
   /* ReportState state; */
   /* /1* bool set_query_thread(GdbThreadId); *1/ */
   GdbThreadId get_current_thread() const;
+  GdbRequest process_debugger_requests(ReportState state = REPORT_NORMAL) override;
 /* rust::String get_exec_file(GdbThreadId request_target) const; */
   /* /1* const std::vector<uint8_t>& get_auxv(); *1/ */
   /* /1* const std::string& get_exec_file(); *1/ */
   /* /1* bool get_is_thread_alive(); *1/ */
   /* /1* const std::string& info get_thread_extra_info(); *1/ */
   /* /1* bool select_thread(); *1/ */
+
+  // here
+  /* const std::vector<uint8_t>& get_mem(int64_t offset, int64_t num_bytes); */
+  /* const std::vector<uint8_t>& get_auxv(); */
+  /* bool is_thread_alive(GdbThreadId tid); */
+  /* bool add_hw_breakpoint(..); */
+  /* bool add_sw_breakpoint(..); */
+  
   /* /1* const std::vector<uint8_t>& get_mem(); *1/ */
   /* /1* bool set_mem(); *1/ */
   /* /1* remote_ptr<void> search_mem(); // todo @zack multivariate *1/ */
   /* /1* void get_offsets(); // rr-todo *1/ */
   /* /1* GdbRegisterValue& get_reg(); *1/ */
+  //GdbRegisterValue get_reg(GdbRegister regname);
+  std::vector<GdbRegisterValue> get_regs() const;
   /* rust::Vec<GdbRegisterValue> get_regs(pid_t tid) const; */
   /* /1* bool set_reg(); *1/ */
   /* /1* int get_stop_reason(); // todo @ zack multivariate *1/ */
@@ -71,6 +82,7 @@ public:
   /* /1* detach(); *1/ */ 
   /* /1* const std::vector<uint8_t>& read_siginfo(); *1/ */
   /* /1* void write_siginfo(); // rr-todo *1/ */
+  const std::vector<uint8_t>& get_auxv(GdbThreadId query_thread) const;
 
 }; // end class
    //

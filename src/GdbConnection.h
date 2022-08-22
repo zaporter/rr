@@ -382,7 +382,7 @@ public:
    * The target should peek at the debugger request in between execution
    * steps.  A new request may need to be serviced.
    */
-  GdbRequest get_request();
+  virtual GdbRequest get_request();
 
   /**
    * Notify the host that this process has exited with |code|.
@@ -407,13 +407,13 @@ public:
   /**
    * Tell the host that |thread| is the current thread.
    */
-  void reply_get_current_thread(GdbThreadId thread);
+  virtual void reply_get_current_thread(GdbThreadId thread);
 
   /**
    * Reply with the target thread's |auxv| pairs. |auxv.empty()|
    * if there was an error reading the auxiliary vector.
    */
-  void reply_get_auxv(const std::vector<uint8_t>& auxv);
+  virtual void reply_get_auxv(const std::vector<uint8_t>& auxv);
 
   /**
    * Reply with the target thread's executable file name

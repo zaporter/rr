@@ -32,8 +32,10 @@
 /* #include "ScopedFd.h" */
 /* #include "kernel_metadata.h" */
 /* #include "log.h" */
+#include "GdbConnection.h"
 #include "main.h"
 
+#include <cstdint>
 #include <elf.h>
 #include <limits.h>
 #include <stdio.h>
@@ -64,6 +66,7 @@
 #include "kernel_metadata.h"
 #include "log.h"
 #include "util.h"
+#include "PassthroughGdbConnection.h"
 
 using namespace std;
 
@@ -79,6 +82,19 @@ static size_t get_reg(const Registers& regs, const ExtraRegisters& extra_regs,
     num_bytes = extra_regs.read_register(buf, regname, defined);
   }
   return num_bytes;
+}
+
+/**
+ * Return the register |which|, which may not have a defined value.
+ */
+static GdbRegisterValue get_reg(const Registers& regs,
+                                    const ExtraRegisters& extra_regs,
+                                    GdbRegister which) {
+  GdbRegisterValue reg;
+  memset(&reg, 0, sizeof(reg));
+  reg.name = which;
+  reg.size = get_reg(regs, extra_regs, &reg.value[0], which, &reg.defined);
+  return reg;
 }
 
 static bool set_reg(Task* target, const GdbRegisterValue& reg) {
@@ -478,79 +494,174 @@ static remote_ptr<void> base_addr_from_rendezvous(Task* t, string fname)
 // ------------------------------------------------------
 
 int64_t BinaryInterface::current_frame_time() const {
-  return s.timeline.current_session().current_frame_time();
+  return timeline.current_session().current_frame_time();
 }
 
+std::vector<GdbRegisterValue> BinaryInterface::get_regs() const{
 
+  BinaryInterface* me = const_cast<BinaryInterface*>(this);
+  Task* target =
+          me->current_session().find_task(last_query_tuid);
+  auto regs = target->regs();
+  auto extra_regs = target->extra_regs();
+  GdbRegister end;
+  // Send values for all the registers we sent XML register descriptions for.
+  // Those descriptions are controlled by GdbConnection::cpu_features().
+  bool have_PKU = dbg->cpu_features() & GdbConnection::CPU_PKU;
+  bool have_AVX = dbg->cpu_features() & GdbConnection::CPU_AVX;
+  switch (regs.arch()) {
+    case x86:
+      end = have_PKU ? DREG_PKRU : (have_AVX ? DREG_YMM7H : DREG_ORIG_EAX);
+      break;
+    case x86_64:
+      end = have_PKU ? DREG_64_PKRU : (have_AVX ? DREG_64_YMM15H : DREG_GS_BASE);
+      break;
+    case aarch64:
+      end = DREG_FPCR;
+      break;
+    default:
+      FATAL() << "Unknown architecture";
+  }
+  std::vector<GdbRegisterValue> rs;
+  for (GdbRegister r = GdbRegister(0); r <= end; r = GdbRegister(r + 1)) {
+    rs.push_back(get_reg(regs, extra_regs, r));
+  }
+  return rs;
+}
 
 bool BinaryInterface::initialize(){
   ReplayResult result;
   int i = 0;
   do {
     ++i;
-    result = s.timeline.replay_step_forward(RUN_CONTINUE);
+    result = timeline.replay_step_forward(RUN_CONTINUE);
     if (result.status == REPLAY_EXITED) {
       //LOG(info) << "Debugger was not launched before end of trace";
       return false;
     }
-  } while (!s.at_target(result));
+  } while (!at_target(result));
+
+  Task* t = timeline.current_session().current_task();
+
+  debuggee_tguid = t->thread_group()->tguid();
+
+  FrameTime first_run_event = std::max(t->vm()->first_run_event(),
+    t->thread_group()->first_run_event());
+  if (first_run_event) {
+    timeline.set_reverse_execution_barrier_event(first_run_event);
+  }
+  //dbg = unique_ptr<GdbConnection>(new GdbConnection(t->tgid(), GdbConnection::Features()));
+  dbg = unique_ptr<PassthroughGdbConnection>(new PassthroughGdbConnection(t->tgid(), GdbConnection::Features()));
+  dbg->set_cpu_features(get_cpu_features(t->arch()));
+  /* dbg = await_connection(t, listen_fd, GdbConnection::Features()); */
+  activate_debugger();
   return true;
 }
-  /* Task* t = timeline.current_session().current_task(); */
-  /* ScopedFd listen_fd = open_socket(flags.dbg_host.c_str(), &port, probe); */
-  /* if (flags.debugger_params_write_pipe) { */
-  /*   DebuggerParams params; */
-  /*   memset(&params, 0, sizeof(params)); */
-  /*   strncpy(params.exe_image, t->vm()->exe_image().c_str(), */
-  /*           sizeof(params.exe_image) - 1); */
-  /*   strncpy(params.host, flags.dbg_host.c_str(), sizeof(params.host) - 1); */
-  /*   params.port = port; */
 
-  /*   ssize_t nwritten = */
-  /*       write(*flags.debugger_params_write_pipe, &params, sizeof(params)); */
-  /*   DEBUG_ASSERT(nwritten == sizeof(params)); */
-  /* } else { */
-  /*   fputs("Launch gdb with\n  ", stderr); */
-  /*   print_debugger_launch_command(t, flags.dbg_host, port, flags.serve_files, */
-  /*                                 flags.debugger_name.c_str(), stderr); */
-  /* } */
-
-  /* if (flags.debugger_params_write_pipe) { */
-  /*   flags.debugger_params_write_pipe->close(); */
-  /* } */
-  /* debuggee_tguid = t->thread_group()->tguid(); */
-
-  /* FrameTime first_run_event = std::max(t->vm()->first_run_event(), */
-  /*   t->thread_group()->first_run_event()); */
-  /* if (first_run_event) { */
-  /*   timeline.set_reverse_execution_barrier_event(first_run_event); */
-  /* } */
-
-  /* do { */
-  /*   LOG(debug) << "initializing debugger connection"; */
-  /*   dbg = await_connection(t, listen_fd, GdbConnection::Features()); */
-  /*   activate_debugger(); */
-
-  /*   GdbRequest last_resume_request; */
-  /*   while (debug_one_step(last_resume_request) == CONTINUE_DEBUGGING) { */
-  /*   } */
-
-  /*   timeline.remove_breakpoints_and_watchpoints(); */
-  /* } while (flags.keep_listening); */
-
-  /* LOG(debug) << "debugger server exiting ..."; */
-
+/* After thinking about this more, I have decided that the request way is probably best 
+ * This means that I need to create a request and then pass it into the debug one step function. Then I need to capture the dbg into my own. */
+/*
+ * Tell dbg what request to serve and then have process_debugger_requests to only do one loop and then return DREQ_NONE; Then call debug_one_step(..);
+ */
 GdbThreadId BinaryInterface::get_current_thread() const{
-    BinaryInterface* me = const_cast<BinaryInterface*>(this);
-    return get_threadid(me->s.current_session(), me->s.last_continue_tuid);
+  BinaryInterface* me = const_cast<BinaryInterface*>(this);
+  GdbRequest req = GdbRequest(DREQ_GET_CURRENT_THREAD);
+  GdbConnection* tbase = me->dbg.get();
+  PassthroughGdbConnection* passthrough = static_cast<PassthroughGdbConnection*>(tbase);
+  passthrough->set_request(req);
+  GdbRequest return_request = me->process_debugger_requests();
+  return passthrough->val_reply_get_current_thread;
 }
+
+const std::vector<uint8_t>& BinaryInterface::get_auxv(GdbThreadId query_thread) const {
+  BinaryInterface* me = const_cast<BinaryInterface*>(this);
+  GdbRequest req = GdbRequest(DREQ_GET_AUXV);
+  GdbConnection* tbase = me->dbg.get();
+  PassthroughGdbConnection* passthrough = static_cast<PassthroughGdbConnection*>(tbase);
+  passthrough->set_request(req);
+  GdbRequest return_request = me->process_debugger_requests();
+  return passthrough->val_reply_get_auxv;
+}
+
+GdbRequest BinaryInterface::process_debugger_requests(ReportState state) {
+    GdbRequest req = dbg->get_request();
+    req.suppress_debugger_stop = false;
+    try_lazy_reverse_singlesteps(req);
+
+    if (req.type == DREQ_READ_SIGINFO) {
+      vector<uint8_t> si_bytes;
+      si_bytes.resize(req.mem().len);
+      memset(si_bytes.data(), 0, si_bytes.size());
+      memcpy(si_bytes.data(), &stop_siginfo,
+             min(si_bytes.size(), sizeof(stop_siginfo)));
+      dbg->reply_read_siginfo(si_bytes);
+
+      // READ_SIGINFO is usually the start of a diversion. It can also be
+      // triggered by "print $_siginfo" but that is rare so we just assume it's
+      // a diversion start; if "print $_siginfo" happens we'll print the correct
+      // siginfo and then incorrectly start a diversion and go haywire :-(.
+      // Ideally we'd come up with a better way to detect diversions so that
+      // "print $_siginfo" works.
+      req = divert(timeline.current_session());
+      /* if (req.type == DREQ_NONE) { */
+      /*   continue; */
+      /* } */
+      // Carry on to process the request that was rejected by
+      // the diversion session
+    }
+
+    if (req.is_resume_request()) {
+      Task* t = current_session().find_task(last_continue_tuid);
+      if (t) {
+        maybe_singlestep_for_event(t, &req);
+      }
+      return req;
+    }
+
+    if (req.type == DREQ_INTERRUPT) {
+      LOG(debug) << "  request to interrupt";
+      return req;
+    }
+
+    if (req.type == DREQ_RESTART) {
+      // Debugger client requested that we restart execution
+      // from the beginning.  Restart our debug session.
+      LOG(debug) << "  request to restart at event " << req.restart().param;
+      return req;
+    }
+    if (req.type == DREQ_DETACH) {
+      LOG(debug) << "  debugger detached";
+      dbg->reply_detach();
+      return req;
+    }
+
+    dispatch_debugger_request(current_session(), req, state);
+    return GdbRequest(DREQ_NONE);
+
+}
+/* int32_t BinaryInterface::set_sw_breakpoint(GdbThreadId target_thread) { */
+/*   GdbRequest req = GdbRequest(DREQ_SET_SW_BREAK); */
+/*   req.target = target_thread; */
+/*   bool is_query = req.type != DREQ_SET_CONTINUE_THREAD; */
+/*   Task* target = */
+/*       req.target.tid > 0 */
+/*           ? session.find_task(req.target.tid) */
+/*           : session.find_task(is_query ? last_query_tuid : last_continue_tuid); */
+/*   if (target) { */
+/*     if (is_query) { */
+/*       last_query_tuid = target->tuid(); */
+/*     } else { */
+/*       last_continue_tuid = target->tuid(); */
+/*     } */
+/*   } */
+/* } */
 
 std::vector<GdbThreadId> BinaryInterface::get_thread_list() const{
     BinaryInterface* me = const_cast<BinaryInterface*>(this);
     vector<GdbThreadId> tids;
     /* if (state != REPORT_THREADS_DEAD) { */
-      for (auto& kv : me->s.current_session().tasks()) {
-        tids.push_back(get_threadid(me->s.current_session(), kv.second->tuid()));
+      for (auto& kv : me->current_session().tasks()) {
+        tids.push_back(get_threadid(me->current_session(), kv.second->tuid()));
       }
     /* } */
     return tids;
