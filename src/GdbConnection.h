@@ -492,7 +492,7 @@ public:
    * |ok| is true if the request was successfully applied, false if
    * not.
    */
-  void reply_watchpoint_request(bool ok);
+  virtual void reply_watchpoint_request(bool ok);
 
   /**
    * DREQ_DETACH was processed.

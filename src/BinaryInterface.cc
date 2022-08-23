@@ -497,7 +497,7 @@ int64_t BinaryInterface::current_frame_time() const {
   return timeline.current_session().current_frame_time();
 }
 
-std::vector<GdbRegisterValue> BinaryInterface::get_regs() const{
+const std::vector<GdbRegisterValue>& BinaryInterface::get_regs() const{
 
   BinaryInterface* me = const_cast<BinaryInterface*>(this);
   Task* target =
@@ -526,7 +526,8 @@ std::vector<GdbRegisterValue> BinaryInterface::get_regs() const{
   for (GdbRegister r = GdbRegister(0); r <= end; r = GdbRegister(r + 1)) {
     rs.push_back(get_reg(regs, extra_regs, r));
   }
-  return rs;
+  me->result_get_regs= rs;
+  return result_get_regs;
 }
 
 bool BinaryInterface::initialize(){
@@ -563,14 +564,27 @@ bool BinaryInterface::initialize(){
 /*
  * Tell dbg what request to serve and then have process_debugger_requests to only do one loop and then return DREQ_NONE; Then call debug_one_step(..);
  */
-GdbThreadId BinaryInterface::get_current_thread() const{
-  BinaryInterface* me = const_cast<BinaryInterface*>(this);
-  GdbRequest req = GdbRequest(DREQ_GET_CURRENT_THREAD);
+PassthroughGdbConnection* run_req(BinaryInterface* me, GdbRequest req){
   GdbConnection* tbase = me->dbg.get();
   PassthroughGdbConnection* passthrough = static_cast<PassthroughGdbConnection*>(tbase);
   passthrough->set_request(req);
   GdbRequest return_request = me->process_debugger_requests();
-  return passthrough->val_reply_get_current_thread;
+  return passthrough;
+}
+
+GdbThreadId BinaryInterface::get_current_thread() const{
+  BinaryInterface* me = const_cast<BinaryInterface*>(this);
+  GdbRequest req = GdbRequest(DREQ_GET_CURRENT_THREAD);
+  return run_req(me,req)->val_reply_get_current_thread;
+}
+
+bool BinaryInterface::set_breakpoint(GdbRequestType type, uintptr_t addr, int32_t kind, std::vector<std::vector<uint8_t>> conditions) {
+  GdbRequest req = GdbRequest(type);
+  req.watch().addr = addr;
+  req.watch().kind = kind;
+  req.watch().conditions = conditions;
+  return run_req(this,req)->val_reply_watchpoint_request;
+  
 }
 
 const std::vector<uint8_t>& BinaryInterface::get_auxv(GdbThreadId query_thread) const {

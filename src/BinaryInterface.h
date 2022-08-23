@@ -53,7 +53,7 @@ public:
   /* /1* bool set_query_thread(GdbThreadId); *1/ */
   GdbThreadId get_current_thread() const;
   GdbRequest process_debugger_requests(ReportState state = REPORT_NORMAL) override;
-/* rust::String get_exec_file(GdbThreadId request_target) const; */
+  /* rust::String get_exec_file(GdbThreadId request_target) const; */
   /* /1* const std::vector<uint8_t>& get_auxv(); *1/ */
   /* /1* const std::string& get_exec_file(); *1/ */
   /* /1* bool get_is_thread_alive(); *1/ */
@@ -73,11 +73,13 @@ public:
   /* /1* void get_offsets(); // rr-todo *1/ */
   /* /1* GdbRegisterValue& get_reg(); *1/ */
   //GdbRegisterValue get_reg(GdbRegister regname);
-  std::vector<GdbRegisterValue> get_regs() const;
+  std::vector<GdbRegisterValue> result_get_regs;
+  const std::vector<GdbRegisterValue>& get_regs() const;
   /* rust::Vec<GdbRegisterValue> get_regs(pid_t tid) const; */
   /* /1* bool set_reg(); *1/ */
   /* /1* int get_stop_reason(); // todo @ zack multivariate *1/ */
   std::vector<GdbThreadId> get_thread_list() const;
+bool set_breakpoint(GdbRequestType type, uintptr_t addr, int32_t kind, std::vector<std::vector<uint8_t>> conditions);
   /* /1* bool watchpoint_request(); *1/ */
   /* /1* detach(); *1/ */ 
   /* /1* const std::vector<uint8_t>& read_siginfo(); *1/ */

@@ -38,10 +38,12 @@ class PassthroughGdbConnection : public GdbConnection {
       return val_set_req;
     }
     PASSTHROUGH(reply_get_current_thread, GdbThreadId);
+    PASSTHROUGH(reply_watchpoint_request, bool);
     std::vector<uint8_t> val_reply_get_auxv;
     void reply_get_auxv(const std::vector<uint8_t>& val) override {
         val_reply_get_auxv = std::vector<uint8_t>(val);
     };
+    
     //PASSTHROUGH(reply_get_auxv, const std::vector<uint8_t>&);
 
 };
