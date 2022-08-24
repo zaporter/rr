@@ -33,7 +33,6 @@
 /* #include "kernel_metadata.h" */
 /* #include "log.h" */
 #include "GdbConnection.h"
-#include "ReplayTimeline.h"
 #include "main.h"
 
 #include <cstdint>
@@ -687,31 +686,15 @@ GdbRequest BinaryInterface::process_debugger_requests(ReportState state) {
 /* } */
 
 std::vector<GdbThreadId> BinaryInterface::get_thread_list() const{
-  BinaryInterface* me = const_cast<BinaryInterface*>(this);
-  vector<GdbThreadId> tids;
-  /* if (state != REPORT_THREADS_DEAD) { */
-    for (auto& kv : me->current_session().tasks()) {
-      tids.push_back(get_threadid(me->current_session(), kv.second->tuid()));
-    }
-  /* } */
-  return tids;
+    BinaryInterface* me = const_cast<BinaryInterface*>(this);
+    vector<GdbThreadId> tids;
+    /* if (state != REPORT_THREADS_DEAD) { */
+      for (auto& kv : me->current_session().tasks()) {
+        tids.push_back(get_threadid(me->current_session(), kv.second->tuid()));
+      }
+    /* } */
+    return tids;
 
-}
-const GdbRegisterValue& BinaryInterface::get_register(GdbRegister reg_name, GdbThreadId query_thread) const{
-  BinaryInterface* me = const_cast<BinaryInterface*>(this);
-  GdbRequest req = GdbRequest(DREQ_GET_REG);
-  req.target = query_thread;
-  req.reg().name = reg_name;
-  return run_req(me, req)->val_reply_get_reg;
-}
-bool BinaryInterface::continue_forward(GdbContAction action) {
-  vector<GdbContAction> actions;
-  actions.push_back(action);
-  GdbRequest req = GdbRequest(DREQ_CONT);
-  req.cont().run_direction = RUN_FORWARD;
-  req.cont().actions = move(actions);
-  run_req(this,req);
-  return true;
 }
 /* rust::String BinaryInterface::get_exec_file(GdbThreadId request_target) const { */
 

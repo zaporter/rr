@@ -143,6 +143,7 @@ enum GdbRequestType {
   DREQ_FILE_PREAD,
   // vFile:close packet, uses params.file_close.
   DREQ_FILE_CLOSE,
+  DREQ_LIBRR_PASSTHROUGH,
 };
 
 enum GdbRestartType {
@@ -387,22 +388,22 @@ public:
   /**
    * Notify the host that this process has exited with |code|.
    */
-  void notify_exit_code(int code);
+  virtual void notify_exit_code(int code);
 
   /**
    * Notify the host that this process has exited from |sig|.
    */
-  void notify_exit_signal(int sig);
+  virtual void notify_exit_signal(int sig);
 
   /**
    * Notify the host that a resume request has "finished", i.e., the
    * target has stopped executing for some reason.  |sig| is the signal
    * that stopped execution, or 0 if execution stopped otherwise.
    */
-  void notify_stop(GdbThreadId which, int sig, const char *reason=nullptr);
+  virtual void notify_stop(GdbThreadId which, int sig, const char *reason=nullptr);
 
   /** Notify the debugger that a restart request failed. */
-  void notify_restart_failed();
+  virtual void notify_restart_failed();
 
   /**
    * Tell the host that |thread| is the current thread.
@@ -418,18 +419,18 @@ public:
   /**
    * Reply with the target thread's executable file name
    */
-  void reply_get_exec_file(const std::string& exec_file);
+  virtual void reply_get_exec_file(const std::string& exec_file);
 
   /**
    * |alive| is true if the requested thread is alive, false if dead.
    */
-  void reply_get_is_thread_alive(bool alive);
+  virtual void reply_get_is_thread_alive(bool alive);
 
   /**
    * |info| is a string containing data about the request target that
    * might be relevant to the debugger user.
    */
-  void reply_get_thread_extra_info(const std::string& info);
+  virtual void reply_get_thread_extra_info(const std::string& info);
 
   /**
    * |ok| is true if req->target can be selected, false otherwise.
@@ -440,26 +441,26 @@ public:
    * The first |mem.size()| bytes of the request were read into |mem|.
    * |mem.size()| must be less than or equal to the length of the request.
    */
-  void reply_get_mem(const std::vector<uint8_t>& mem);
+  virtual void reply_get_mem(const std::vector<uint8_t>& mem);
 
   /**
    * |ok| is true if a SET_MEM request succeeded, false otherwise.  This
    * function *must* be called whenever a SET_MEM request is made,
    * regardless of success/failure or special interpretation.
    */
-  void reply_set_mem(bool ok);
+  virtual void reply_set_mem(bool ok);
 
   /**
    * Reply to the DREQ_SEARCH_MEM request.
    * |found| is true if we found the searched-for bytes starting at address
    * |addr|.
    */
-  void reply_search_mem(bool found, remote_ptr<void> addr);
+  virtual void reply_search_mem(bool found, remote_ptr<void> addr);
 
   /**
    * Reply to the DREQ_GET_OFFSETS request.
    */
-  void reply_get_offsets(/* TODO */);
+  virtual void reply_get_offsets(/* TODO */);
 
   /**
    * Send |value| back to the debugger host.  |value| may be undefined.
@@ -475,18 +476,18 @@ public:
   /**
    * Pass |ok = true| iff the requested register was successfully set.
    */
-  void reply_set_reg(bool ok);
+  virtual void reply_set_reg(bool ok);
 
   /**
    * Reply to the DREQ_GET_STOP_REASON request.
    */
-  void reply_get_stop_reason(GdbThreadId which, int sig);
+  virtual void reply_get_stop_reason(GdbThreadId which, int sig);
 
   /**
    * |threads| contains the list of live threads, of which there are
    * |len|.
    */
-  void reply_get_thread_list(const std::vector<GdbThreadId>& threads);
+  virtual void reply_get_thread_list(const std::vector<GdbThreadId>& threads);
 
   /**
    * |ok| is true if the request was successfully applied, false if
@@ -501,58 +502,58 @@ public:
    * However, some versions of gdb expect a response and time out
    * awaiting it, wasting developer time.
    */
-  void reply_detach();
+  virtual void reply_detach();
 
   /**
    * Pass the siginfo_t and its size (as requested by the debugger) in
    * |si_bytes| and |num_bytes| if successfully read.  Otherwise pass
    * |si_bytes = nullptr|.
    */
-  void reply_read_siginfo(const std::vector<uint8_t>& si_bytes);
+  virtual void reply_read_siginfo(const std::vector<uint8_t>& si_bytes);
   /**
    * Not yet implemented, but call this after a WRITE_SIGINFO request
    * anyway.
    */
-  void reply_write_siginfo(/* TODO*/);
+  virtual void reply_write_siginfo(/* TODO*/);
 
   /**
    * Send a manual text response to a rr cmd (maintenance) packet.
    */
-  void reply_rr_cmd(const std::string& text);
+  virtual void reply_rr_cmd(const std::string& text);
 
   /**
    * Send a qSymbol response to gdb, requesting the address of the
    * symbol |name|.
    */
-  void send_qsymbol(const std::string& name);
+  virtual void send_qsymbol(const std::string& name);
 
   /**
    * The "all done" response to a qSymbol packet from gdb.
    */
-  void qsymbols_finished();
+  virtual void qsymbols_finished();
 
   /**
    * Respond to a qGetTLSAddr packet.  If |ok| is true, then respond
    * with |address|.  If |ok| is false, respond with an error.
    */
-  void reply_tls_addr(bool ok, remote_ptr<void> address);
+  virtual void reply_tls_addr(bool ok, remote_ptr<void> address);
 
   /**
    * Respond to a vFile:setfs
    */
-  void reply_setfs(int err);
+  virtual void reply_setfs(int err);
   /**
    * Respond to a vFile:open
    */
-  void reply_open(int fd, int err);
+  virtual void reply_open(int fd, int err);
   /**
    * Respond to a vFile:pread
    */
-  void reply_pread(const uint8_t* bytes, ssize_t len, int err);
+  virtual void reply_pread(const uint8_t* bytes, ssize_t len, int err);
   /**
    * Respond to a vFile:close
    */
-  void reply_close(int err);
+  virtual void reply_close(int err);
 
   /**
    * Create a checkpoint of the given Session with the given id. Delete the

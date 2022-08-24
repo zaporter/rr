@@ -16,6 +16,11 @@
     has_new_val = true; \
     val_ ## name = val; \
   }
+#define PASSTHROUGH_REF(name, type, typein) type val_ ## name; \
+  void name (typein val) override { \
+    has_new_val = true; \
+    val_ ## name = val; \
+  }
 namespace rr{
 
 class PassthroughGdbConnection : public GdbConnection {
@@ -39,10 +44,13 @@ class PassthroughGdbConnection : public GdbConnection {
     }
     PASSTHROUGH(reply_get_current_thread, GdbThreadId);
     PASSTHROUGH(reply_watchpoint_request, bool);
-    std::vector<uint8_t> val_reply_get_auxv;
-    void reply_get_auxv(const std::vector<uint8_t>& val) override {
-        val_reply_get_auxv = std::vector<uint8_t>(val);
-    };
+    PASSTHROUGH_REF(reply_get_thread_extra_info, std::string, const std::string&); 
+    PASSTHROUGH_REF(reply_get_reg, GdbRegisterValue, const GdbRegisterValue&);
+    PASSTHROUGH_REF(reply_get_auxv, std::vector<uint8_t>, const std::vector<uint8_t>&);
+    /* std::vector<uint8_t> val_reply_get_auxv; */
+    /* void reply_get_auxv(const std::vector<uint8_t>& val) override { */
+    /*     val_reply_get_auxv = std::vector<uint8_t>(val); */
+    /* }; */
     
     //PASSTHROUGH(reply_get_auxv, const std::vector<uint8_t>&);
 
