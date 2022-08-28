@@ -81,6 +81,9 @@ public:
   std::vector<GdbRegisterValue> result_get_regs;
   const std::vector<GdbRegisterValue>& get_regs() const;
   const GdbRegisterValue& get_register(GdbRegister reg_name, GdbThreadId query_thread) const;
+  const std::vector<uint8_t>& file_read(const std::string& file_name, int flags, int mode);
+  
+  void setfs_pid(int64_t pid);
 
   bool continue_forward(GdbContAction action);
   /* rust::Vec<GdbRegisterValue> get_regs(pid_t tid) const; */

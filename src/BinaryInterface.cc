@@ -51,6 +51,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <iostream>
 
 #include "BreakpointCondition.h"
 #include "ElfReader.h"
@@ -572,6 +573,8 @@ PassthroughGdbConnection* run_req(BinaryInterface* me, GdbRequest req){
   GdbRequest return_request = me->placeholder_process_debugger_requests();
   if (return_request.type != DREQ_LIBRR_PASSTHROUGH){
     me->last_debugger_request_result = return_request;
+    /* while (debug_one_step(me->last_resume_request) == ContinueOrStop::CONTINUE_DEBUGGING) { */
+    /* } */
     me->continue_or_stop = me->debug_one_step(me->last_resume_request);
   }
   return passthrough;
@@ -590,6 +593,12 @@ const std::string& BinaryInterface::get_thread_extra_info(GdbThreadId target) co
   return run_req(me,req)->val_reply_get_thread_extra_info;
 
 }
+
+void BinaryInterface::setfs_pid(int64_t pid){
+  GdbRequest req = GdbRequest(DREQ_FILE_SETFS);
+  req.file_setfs().pid = pid;
+  run_req(this, req);
+}
 bool BinaryInterface::set_sw_breakpoint(uintptr_t addr, int32_t kind) {
   std::vector<std::vector<uint8_t>> conds;
   return set_breakpoint(DREQ_SET_SW_BREAK, addr, kind, conds);
@@ -602,6 +611,39 @@ bool BinaryInterface::set_breakpoint(GdbRequestType type, uintptr_t addr, int32_
   req.watch().conditions = conditions;
   return run_req(this,req)->val_reply_watchpoint_request;
   
+}
+const std::vector<uint8_t>& BinaryInterface::file_read(const std::string& file_name, int flags, int mode)  {
+  // OPEN FILE
+  GdbRequest req = GdbRequest(DREQ_FILE_OPEN);
+  req.file_open().file_name = std::string(file_name);
+  req.file_open().flags = flags;
+  req.file_open().mode = mode;
+  auto passthrough = run_req(this, req);
+  int fd = passthrough->val_reply_open_fd;
+  int err = passthrough->val_reply_open_err;
+  if (err != 0){
+    std::cout << "ERROR OPENING FILE TODO" << std::endl;
+  }
+  // READ FILE 
+  req = GdbRequest(DREQ_FILE_PREAD);
+  req.file_pread().fd = fd;
+  req.file_pread().offset = 0;
+  req.file_pread().size = 100000000; // Read files up to 100Mb
+  passthrough = run_req(this, req);
+  err = passthrough ->val_reply_pread_err;
+  const std::vector<uint8_t>& bytes = passthrough->val_reply_pread_bytes;
+  if (err != 0){
+    std::cout << "ERROR READING FILE TODO" << std::endl;
+  }
+  // CLOSE FILE
+  req = GdbRequest(DREQ_FILE_CLOSE);
+  req.file_close().fd = fd;
+  passthrough = run_req(this, req);
+  err = passthrough ->val_reply_close;
+  if (err != 0){
+    std::cout << "ERROR CLOSING FILE TODO" << std::endl;
+  }
+  return bytes;
 }
 
 const std::vector<uint8_t>& BinaryInterface::get_auxv(GdbThreadId query_thread) const {
