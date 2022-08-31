@@ -62,6 +62,7 @@ class PassthroughGdbConnection : public GdbConnection {
       val_reply_open_fd = fd;
       val_reply_open_err = err;
     }
+
     int val_reply_pread_err;
     std::vector<uint8_t> val_reply_pread_bytes;
     void reply_pread(const uint8_t* bytes, ssize_t len, int err) override{
@@ -72,6 +73,29 @@ class PassthroughGdbConnection : public GdbConnection {
       val_reply_pread_err = err;
     }
     PASSTHROUGH(reply_close, int);
+
+
+    void send_qsymbol(const std::string& name) override {
+      std::cout<<"send_qsymbol "<<name  <<" called. This should NEVER be called. Please report this" << std::endl;
+    };
+    void qsymbols_finished() override{
+      std::cout<<"qsymbols_finished called. This should NEVER be called. Please report this" << std::endl;
+
+    };
+    void add_pass_signal(int32_t signal) {
+      pass_signals.insert(signal);
+    }
+    void clear_pass_signals(){
+      pass_signals.clear();
+    }
+    void notify_stop(GdbThreadId which, int sig, const char *reason=nullptr) override {
+      std::cout<<"notify_stop called. " << std::endl;
+
+    }
+    
+    bool sniff_packet() override {
+      return false;
+    }
     /* void reply_close(int err) override{ */
     /*   DEBUG_ASSERT(DREQ_FILE_CLOSE == req.type); */
     /*   if (err) { */

@@ -34,7 +34,7 @@ namespace rr {
 class BinaryInterface  : public GdbServer {
 public: 
   BinaryInterface(std::shared_ptr<ReplaySession> session, const GdbServer::Target& target)
-    : GdbServer(session, target)
+    : GdbServer(session, target), is_processing_requests(false)
     /*GdbServer( session, target), state(REPORT_NORMAL)*/
   {
 
@@ -44,6 +44,7 @@ public:
   };
 
   bool initialize();
+  bool is_processing_requests;
   int64_t current_frame_time() const;
 
   // This has to be virtual in order to force the destructor to be in the library
@@ -58,46 +59,25 @@ public:
   ContinueOrStop continue_or_stop;
   GdbRequest process_debugger_requests(ReportState state = REPORT_NORMAL) override;
   GdbRequest placeholder_process_debugger_requests(ReportState state = REPORT_NORMAL);
-  /* rust::String get_exec_file(GdbThreadId request_target) const; */
-  /* /1* const std::vector<uint8_t>& get_auxv(); *1/ */
-  /* /1* const std::string& get_exec_file(); *1/ */
-  /* /1* bool get_is_thread_alive(); *1/ */
-  /* /1* const std::string& info get_thread_extra_info(); *1/ */
-  /* /1* bool select_thread(); *1/ */
 
-  // here
-  /* const std::vector<uint8_t>& get_mem(int64_t offset, int64_t num_bytes); */
-  /* const std::vector<uint8_t>& get_auxv(); */
-  /* bool is_thread_alive(GdbThreadId tid); */
-  /* bool add_hw_breakpoint(..); */
-  /* bool add_sw_breakpoint(..); */
-  
-  /* /1* const std::vector<uint8_t>& get_mem(); *1/ */
-  /* /1* bool set_mem(); *1/ */
-  /* /1* remote_ptr<void> search_mem(); // todo @zack multivariate *1/ */
-  /* /1* void get_offsets(); // rr-todo *1/ */
-  /* /1* GdbRegisterValue& get_reg(); *1/ */
-  //GdbRegisterValue get_reg(GdbRegister regname);
+  void add_pass_signal(int32_t signal);
+  void clear_pass_signals();
   std::vector<GdbRegisterValue> result_get_regs;
   const std::vector<GdbRegisterValue>& get_regs() const;
   const GdbRegisterValue& get_register(GdbRegister reg_name, GdbThreadId query_thread) const;
   const std::vector<uint8_t>& file_read(const std::string& file_name, int flags, int mode);
+  bool set_symbol(const std::string& name, uintptr_t address);
   
   void setfs_pid(int64_t pid);
 
   bool continue_forward(GdbContAction action);
-  /* rust::Vec<GdbRegisterValue> get_regs(pid_t tid) const; */
-  /* /1* bool set_reg(); *1/ */
-  /* /1* int get_stop_reason(); // todo @ zack multivariate *1/ */
   std::vector<GdbThreadId> get_thread_list() const;
   const std::string& get_thread_extra_info(GdbThreadId target) const;
   bool set_sw_breakpoint(uintptr_t addr, int32_t kind);
+  bool set_hw_breakpoint(uintptr_t addr, int32_t kind);
   bool set_breakpoint(GdbRequestType type, uintptr_t addr, int32_t kind, std::vector<std::vector<uint8_t>> conditions);
-  /* /1* bool watchpoint_request(); *1/ */
-  /* /1* detach(); *1/ */ 
-  /* /1* const std::vector<uint8_t>& read_siginfo(); *1/ */
-  /* /1* void write_siginfo(); // rr-todo *1/ */
   const std::vector<uint8_t>& get_auxv(GdbThreadId query_thread) const;
+
 
 }; // end class
    //

@@ -532,6 +532,7 @@ const std::vector<GdbRegisterValue>& BinaryInterface::get_regs() const{
   return result_get_regs;
 }
 
+
 bool BinaryInterface::initialize(){
   ReplayResult result;
   int i = 0;
@@ -556,6 +557,7 @@ bool BinaryInterface::initialize(){
   //dbg = unique_ptr<GdbConnection>(new GdbConnection(t->tgid(), GdbConnection::Features()));
   dbg = unique_ptr<PassthroughGdbConnection>(new PassthroughGdbConnection(t->tgid(), GdbConnection::Features()));
   dbg->set_cpu_features(get_cpu_features(t->arch()));
+  activate_debugger();
   /* dbg = await_connection(t, listen_fd, GdbConnection::Features()); */
   activate_debugger();
   return true;
@@ -566,15 +568,30 @@ bool BinaryInterface::initialize(){
 /*
  * Tell dbg what request to serve and then have process_debugger_requests to only do one loop and then return DREQ_NONE; Then call debug_one_step(..);
  */
+
+// if is_processing_requests => placeholder_process_debugger_requests
+//    
+//    resp = run(req)
+//    if resp == PASSTHROUGH {
+//      last_response = resp;
+//      debug_one_step();
+//    }
 PassthroughGdbConnection* run_req(BinaryInterface* me, GdbRequest req){
   GdbConnection* tbase = me->dbg.get();
   PassthroughGdbConnection* passthrough = static_cast<PassthroughGdbConnection*>(tbase);
   passthrough->set_request(req);
+  if (me->is_processing_requests) {
+    me->last_debugger_request_result = me->placeholder_process_debugger_requests();
+    if (me->last_debugger_request_result.type == DREQ_LIBRR_PASSTHROUGH){
+      me->debug_one_step(me->last_resume_request);
+    }
+    
+  }else{
+    me->debug_one_step(me->last_resume_request);
+  }
   GdbRequest return_request = me->placeholder_process_debugger_requests();
   if (return_request.type != DREQ_LIBRR_PASSTHROUGH){
     me->last_debugger_request_result = return_request;
-    /* while (debug_one_step(me->last_resume_request) == ContinueOrStop::CONTINUE_DEBUGGING) { */
-    /* } */
     me->continue_or_stop = me->debug_one_step(me->last_resume_request);
   }
   return passthrough;
@@ -584,6 +601,18 @@ GdbThreadId BinaryInterface::get_current_thread() const{
   BinaryInterface* me = const_cast<BinaryInterface*>(this);
   GdbRequest req = GdbRequest(DREQ_GET_CURRENT_THREAD);
   return run_req(me,req)->val_reply_get_current_thread;
+}
+
+void BinaryInterface::add_pass_signal(int32_t signal){
+  GdbConnection* tbase = dbg.get();
+  PassthroughGdbConnection* passthrough = static_cast<PassthroughGdbConnection*>(tbase);
+  passthrough->add_pass_signal(signal);
+
+}
+void BinaryInterface::clear_pass_signals(){
+  GdbConnection* tbase = dbg.get();
+  PassthroughGdbConnection* passthrough = static_cast<PassthroughGdbConnection*>(tbase);
+  passthrough->clear_pass_signals();
 }
 
 const std::string& BinaryInterface::get_thread_extra_info(GdbThreadId target) const{
@@ -599,9 +628,23 @@ void BinaryInterface::setfs_pid(int64_t pid){
   req.file_setfs().pid = pid;
   run_req(this, req);
 }
+
+bool BinaryInterface::set_symbol(const std::string& name, uintptr_t address){
+  GdbRequest req = GdbRequest(DREQ_QSYMBOL);
+  req.sym().address=address;
+  req.sym().has_address=true;
+  req.sym().name = std::string(name);
+  run_req(this,req);
+  return true; //TODO
+
+}
 bool BinaryInterface::set_sw_breakpoint(uintptr_t addr, int32_t kind) {
   std::vector<std::vector<uint8_t>> conds;
   return set_breakpoint(DREQ_SET_SW_BREAK, addr, kind, conds);
+}
+bool BinaryInterface::set_hw_breakpoint(uintptr_t addr, int32_t kind) {
+  std::vector<std::vector<uint8_t>> conds;
+  return set_breakpoint(DREQ_SET_HW_BREAK, addr, kind, conds);
 }
 
 bool BinaryInterface::set_breakpoint(GdbRequestType type, uintptr_t addr, int32_t kind, std::vector<std::vector<uint8_t>> conditions) {
@@ -707,9 +750,41 @@ GdbRequest BinaryInterface::placeholder_process_debugger_requests(ReportState st
     dispatch_debugger_request(current_session(), req, state);
     return GdbRequest(DREQ_LIBRR_PASSTHROUGH);
 }
-
+// run_req 
+// if is_processing_requests => placeholder_process_debugger_requests
+//    
+//    resp = run(req)
+//    if resp == PASSTHROUGH {
+//      last_response = resp;
+//      debug_one_step();
+//    }
+//
+//
+//
+// if not => debug_one_step()
+//    if is_processing_requests {
+//      is_processing_requests=false;
+//      return last_response
+//    }else{
+  //    is_processing_requests = true
+  //    rep= run(req)
+  //    if rep != PASSTHROUGH => is_processing_requests=false
+  //    return rep
+//
+//    }
+//
 GdbRequest BinaryInterface::process_debugger_requests(ReportState state) {
-  return last_debugger_request_result;
+  if (is_processing_requests){
+    is_processing_requests=false;
+    return last_debugger_request_result;
+  }else {
+    is_processing_requests = true;
+    GdbRequest return_request = placeholder_process_debugger_requests();
+    if (return_request.type != DREQ_LIBRR_PASSTHROUGH){
+      is_processing_requests=false;
+    }
+    return return_request;
+  }
 }
 /* int32_t BinaryInterface::set_sw_breakpoint(GdbThreadId target_thread) { */
 /*   GdbRequest req = GdbRequest(DREQ_SET_SW_BREAK); */

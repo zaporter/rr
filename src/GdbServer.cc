@@ -14,6 +14,7 @@
 #include <limits>
 #include <map>
 #include <sstream>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -1317,6 +1318,9 @@ GdbServer::ContinueOrStop GdbServer::debug_one_step(
     req = process_debugger_requests();
   } else {
     req = last_resume_request;
+  }
+  if (req.type == DREQ_LIBRR_PASSTHROUGH){
+      return CONTINUE_DEBUGGING;
   }
 
   ContinueOrStop s;

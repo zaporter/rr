@@ -577,7 +577,7 @@ public:
    * Return true if there's a new packet to be read/process (whether
    * incomplete or not), and false if there isn't one.
    */
-  bool sniff_packet();
+  virtual bool sniff_packet();
 
   const Features& features() { return features_; }
 
@@ -608,7 +608,7 @@ public:
 
   bool is_pass_signal(int sig);
 
-private:
+protected:
   /**
    * read() incoming data exactly one time, successfully.  May block.
    */
