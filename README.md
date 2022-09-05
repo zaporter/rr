@@ -1,6 +1,6 @@
 # Overview of this project
 
-This is a fork of rr which is designed for [librr-rs](https://github.com/zaporter/librr-rs). It will try to stay as close as possible to the original but is designed to be compiled into a dynamic library instead of an executable. 
+This is a fork of rr which is designed for [librr_rs](https://github.com/zaporter/librr_rs). It will try to stay as close as possible to the original but is designed to be compiled into a dynamic library instead of an executable. 
 
 This is a VERY immature repo. Do not use this for your own projects yet. 
 

@@ -53,6 +53,7 @@ public:
   /* ReportState state; */
   /* /1* bool set_query_thread(GdbThreadId); *1/ */
   GdbThreadId get_current_thread() const;
+  /* std::string exec_file; */
 
   GdbRequest last_debugger_request_result;
   GdbRequest last_resume_request;
@@ -66,6 +67,7 @@ public:
   const std::vector<GdbRegisterValue>& get_regs() const;
   const GdbRegisterValue& get_register(GdbRegister reg_name, GdbThreadId query_thread) const;
   const std::vector<uint8_t>& file_read(const std::string& file_name, int flags, int mode);
+  const std::string& get_exec_file() const;
   bool set_symbol(const std::string& name, uintptr_t address);
   
   void setfs_pid(int64_t pid);

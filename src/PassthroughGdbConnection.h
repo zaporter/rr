@@ -54,8 +54,8 @@ class PassthroughGdbConnection : public GdbConnection {
     PASSTHROUGH(reply_watchpoint_request, bool);
     PASSTHROUGH_REF(reply_get_thread_extra_info, std::string, const std::string&); 
     PASSTHROUGH_REF(reply_get_reg, GdbRegisterValue, const GdbRegisterValue&);
+    PASSTHROUGH_REF(reply_get_exec_file, std::string, const std::string&);
     PASSTHROUGH_REF(reply_get_auxv, std::vector<uint8_t>, const std::vector<uint8_t>&);
-
     int val_reply_open_fd;
     int val_reply_open_err;
     void reply_open(int fd, int err) override{
@@ -96,6 +96,7 @@ class PassthroughGdbConnection : public GdbConnection {
     bool sniff_packet() override {
       return false;
     }
+    
     /* void reply_close(int err) override{ */
     /*   DEBUG_ASSERT(DREQ_FILE_CLOSE == req.type); */
     /*   if (err) { */

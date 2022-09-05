@@ -548,7 +548,7 @@ bool BinaryInterface::initialize(){
   Task* t = timeline.current_session().current_task();
 
   debuggee_tguid = t->thread_group()->tguid();
-
+  /* exec_file = std::string(t->vm()->exe_image().c_str()); */
   FrameTime first_run_event = std::max(t->vm()->first_run_event(),
     t->thread_group()->first_run_event());
   if (first_run_event) {
@@ -595,6 +595,15 @@ PassthroughGdbConnection* run_req(BinaryInterface* me, GdbRequest req){
     me->continue_or_stop = me->debug_one_step(me->last_resume_request);
   }
   return passthrough;
+}
+
+const std::string& BinaryInterface::get_exec_file() const{
+  BinaryInterface* me = const_cast<BinaryInterface*>(this);
+  GdbRequest req = GdbRequest(DREQ_GET_EXEC_FILE);
+  Task* t = me->timeline.current_session().current_task();
+  req.target.pid = req.target.tid = t->tuid().tid();
+  return run_req(me,req)->val_reply_get_exec_file;
+  /* return exec_file; */
 }
 
 GdbThreadId BinaryInterface::get_current_thread() const{

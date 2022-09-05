@@ -441,7 +441,7 @@ void GdbServer::dispatch_debugger_request(Session& session,
       if (t) {
         dbg->reply_get_exec_file(t->vm()->exe_image());
       } else {
-        dbg->reply_get_exec_file(string());
+        dbg->reply_get_exec_file(string(""));
       }
       return;
     }
