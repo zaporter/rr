@@ -579,21 +579,37 @@ bool BinaryInterface::initialize(){
 PassthroughGdbConnection* run_req(BinaryInterface* me, GdbRequest req){
   GdbConnection* tbase = me->dbg.get();
   PassthroughGdbConnection* passthrough = static_cast<PassthroughGdbConnection*>(tbase);
-  passthrough->set_request(req);
-  if (me->is_processing_requests) {
-    me->last_debugger_request_result = me->placeholder_process_debugger_requests();
-    if (me->last_debugger_request_result.type == DREQ_LIBRR_PASSTHROUGH){
-      me->debug_one_step(me->last_resume_request);
-    }
+  /* passthrough->set_request(req); */
+  /* if (me->is_processing_requests) { */
+  /*   me->last_debugger_request_result = me->placeholder_process_debugger_requests(); */
+  /*   if (me->last_debugger_request_result.type == DREQ_LIBRR_PASSTHROUGH){ */
+  /*     do { */
+  /*       me->debug_one_step(me->last_resume_request); */
+  /*     } while (!me->is_processing_requests); */
+  /*   } */
     
-  }else{
+  /* }else{ */
+  /*     do { */
+  /*       me->debug_one_step(me->last_resume_request); */
+  /*     } while (!me->is_processing_requests); */
+  /*   /1* me->debug_one_step(me->last_resume_request); *1/ */
+  /* } */
+  passthrough->set_request(req);
+  me->last_debugger_request_result = me->placeholder_process_debugger_requests();
+  if (me->last_debugger_request_result.type != DREQ_LIBRR_PASSTHROUGH){
+    me->is_processing_requests=false;
+  }
+  int num_loops = 0;
+  while(!me->is_processing_requests) {
+    num_loops++;
     me->debug_one_step(me->last_resume_request);
-  }
-  GdbRequest return_request = me->placeholder_process_debugger_requests();
-  if (return_request.type != DREQ_LIBRR_PASSTHROUGH){
-    me->last_debugger_request_result = return_request;
-    me->continue_or_stop = me->debug_one_step(me->last_resume_request);
-  }
+    me->last_debugger_request_result = GdbRequest(DREQ_LIBRR_PASSTHROUGH);
+  } 
+  /* GdbRequest return_request = me->last_debugger_request_result;//me->placeholder_process_debugger_requests(); */
+  /* if (return_request.type != DREQ_LIBRR_PASSTHROUGH){ */
+  /*   me->last_debugger_request_result = return_request; */
+  /*   me->continue_or_stop = me->debug_one_step(me->last_resume_request); */
+  /* } */
   return passthrough;
 }
 
@@ -603,7 +619,6 @@ const std::string& BinaryInterface::get_exec_file() const{
   Task* t = me->timeline.current_session().current_task();
   req.target.pid = req.target.tid = t->tuid().tid();
   return run_req(me,req)->val_reply_get_exec_file;
-  /* return exec_file; */
 }
 
 GdbThreadId BinaryInterface::get_current_thread() const{
@@ -647,9 +662,23 @@ bool BinaryInterface::set_symbol(const std::string& name, uintptr_t address){
   return true; //TODO
 
 }
+bool BinaryInterface::set_continue_thread(GdbThreadId tid) {
+  GdbRequest req = GdbRequest(DREQ_SET_CONTINUE_THREAD);
+  req.target = tid;
+  return run_req(this,req)->val_reply_select_thread;
+}
+bool BinaryInterface::set_query_thread(GdbThreadId tid) {
+  GdbRequest req = GdbRequest(DREQ_SET_QUERY_THREAD);
+  req.target = tid;
+  return run_req(this,req)->val_reply_select_thread;
+}
 bool BinaryInterface::set_sw_breakpoint(uintptr_t addr, int32_t kind) {
   std::vector<std::vector<uint8_t>> conds;
   return set_breakpoint(DREQ_SET_SW_BREAK, addr, kind, conds);
+}
+bool BinaryInterface::remove_sw_breakpoint(uintptr_t addr, int32_t kind) {
+  std::vector<std::vector<uint8_t>> conds;
+  return set_breakpoint(DREQ_REMOVE_SW_BREAK, addr, kind, conds);
 }
 bool BinaryInterface::set_hw_breakpoint(uintptr_t addr, int32_t kind) {
   std::vector<std::vector<uint8_t>> conds;
@@ -662,7 +691,13 @@ bool BinaryInterface::set_breakpoint(GdbRequestType type, uintptr_t addr, int32_
   req.watch().kind = kind;
   req.watch().conditions = conditions;
   return run_req(this,req)->val_reply_watchpoint_request;
-  
+}
+bool BinaryInterface::has_breakpoint_at_address(GdbThreadId tid, uintptr_t addr) const {
+  BinaryInterface* me = const_cast<BinaryInterface*>(this);
+  Task* target = me->current_session().find_task(tid.tid);
+  ReplayTask* replay_task =
+      me->timeline.current_session().find_task(target->tuid());
+  return me->timeline.has_breakpoint_at_address(replay_task, addr);
 }
 const std::vector<uint8_t>& BinaryInterface::file_read(const std::string& file_name, int flags, int mode)  {
   // OPEN FILE
@@ -783,17 +818,15 @@ GdbRequest BinaryInterface::placeholder_process_debugger_requests(ReportState st
 //    }
 //
 GdbRequest BinaryInterface::process_debugger_requests(ReportState state) {
-  if (is_processing_requests){
-    is_processing_requests=false;
-    return last_debugger_request_result;
-  }else {
-    is_processing_requests = true;
-    GdbRequest return_request = placeholder_process_debugger_requests();
-    if (return_request.type != DREQ_LIBRR_PASSTHROUGH){
-      is_processing_requests=false;
-    }
-    return return_request;
-  }
+  is_processing_requests = true;
+  return last_debugger_request_result;
+  /* if (!is_processing_requests){ */
+  /*   is_processing_requests=false; */
+  /*   return last_debugger_request_result; */
+  /* }else { */
+  /*   is_processing_requests = true; */
+  /*   return GdbRequest(DREQ_LIBRR_PASSTHROUGH); */
+  /* } */
 }
 /* int32_t BinaryInterface::set_sw_breakpoint(GdbThreadId target_thread) { */
 /*   GdbRequest req = GdbRequest(DREQ_SET_SW_BREAK); */
@@ -835,6 +868,15 @@ bool BinaryInterface::continue_forward(GdbContAction action) {
   actions.push_back(action);
   GdbRequest req = GdbRequest(DREQ_CONT);
   req.cont().run_direction = RUN_FORWARD;
+  req.cont().actions = move(actions);
+  run_req(this,req);
+  return true;
+}
+bool BinaryInterface::continue_backward(GdbContAction action) {
+  vector<GdbContAction> actions;
+  actions.push_back(action);
+  GdbRequest req = GdbRequest(DREQ_CONT);
+  req.cont().run_direction = RUN_BACKWARD;
   req.cont().actions = move(actions);
   run_req(this,req);
   return true;

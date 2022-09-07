@@ -1320,8 +1320,13 @@ GdbServer::ContinueOrStop GdbServer::debug_one_step(
     req = last_resume_request;
   }
   if (req.type == DREQ_LIBRR_PASSTHROUGH){
+     /* std::cout<< "a"<<std::endl; */
       return CONTINUE_DEBUGGING;
   }
+  /* else { */
+     /* std::cout<< "b"<<std::endl; */
+  /* } */
+  /* std::cout << "RUNNING REQ OF TYPE "<< req.type << std::endl; */
 
   ContinueOrStop s;
   if (detach_or_restart(req, &s)) {
@@ -1330,6 +1335,7 @@ GdbServer::ContinueOrStop GdbServer::debug_one_step(
   }
 
   if (req.is_resume_request()) {
+     /* std::cout<< "c"<<std::endl; */
     last_resume_request = req;
   } else {
     DEBUG_ASSERT(req.type == DREQ_INTERRUPT);

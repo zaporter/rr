@@ -52,6 +52,8 @@ public:
   virtual ~BinaryInterface() {};
   /* ReportState state; */
   /* /1* bool set_query_thread(GdbThreadId); *1/ */
+  bool set_continue_thread(GdbThreadId);
+  bool set_query_thread(GdbThreadId);
   GdbThreadId get_current_thread() const;
   /* std::string exec_file; */
 
@@ -73,12 +75,15 @@ public:
   void setfs_pid(int64_t pid);
 
   bool continue_forward(GdbContAction action);
+  bool continue_backward(GdbContAction action);
   std::vector<GdbThreadId> get_thread_list() const;
   const std::string& get_thread_extra_info(GdbThreadId target) const;
   bool set_sw_breakpoint(uintptr_t addr, int32_t kind);
+  bool remove_sw_breakpoint(uintptr_t addr, int32_t kind);
   bool set_hw_breakpoint(uintptr_t addr, int32_t kind);
   bool set_breakpoint(GdbRequestType type, uintptr_t addr, int32_t kind, std::vector<std::vector<uint8_t>> conditions);
   const std::vector<uint8_t>& get_auxv(GdbThreadId query_thread) const;
+  bool has_breakpoint_at_address(GdbThreadId tuid, uintptr_t addr) const;
 
 
 }; // end class

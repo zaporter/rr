@@ -4,6 +4,7 @@
 
 #include <math.h>
 #include <sstream>
+#include <iostream>
 
 #include "core.h"
 #include "fast_forward.h"

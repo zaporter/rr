@@ -2,6 +2,7 @@
 #define RR_PASSTHROUGH_GDB_CONNECTION
 
 #include "GdbConnection.h"
+#include <cassert>
 #include <iostream>
 #include <vector>
 
@@ -29,7 +30,12 @@ class PassthroughGdbConnection : public GdbConnection {
     PassthroughGdbConnection(pid_t tgid, const Features& features) : 
       GdbConnection(tgid, features),
       has_new_val(false)
-  {};
+  {
+  
+    multiprocess_supported_ = true;
+    hwbreak_supported_ = true;
+    swbreak_supported_ = true;
+  };
     
     /* void reply_get_auxv(const std::vector<uint8_t>& auxv) override { */
 
@@ -41,7 +47,11 @@ class PassthroughGdbConnection : public GdbConnection {
       val_set_req = request;
     }
     GdbRequest get_request() override {
-      return val_set_req;
+      // prevent double getting
+      assert(val_set_req.type != DREQ_NONE);
+      auto tmp = val_set_req;
+      val_set_req = GdbRequest(DREQ_NONE);
+      return tmp;
     }
     void reply_setfs(int err) override {
         std::cout<<"SETFS"<<std::endl;
@@ -52,6 +62,17 @@ class PassthroughGdbConnection : public GdbConnection {
     };
     PASSTHROUGH(reply_get_current_thread, GdbThreadId);
     PASSTHROUGH(reply_watchpoint_request, bool);
+
+    bool val_reply_select_thread = false;
+    void reply_select_thread (bool ok) override {
+      if (ok && DREQ_SET_CONTINUE_THREAD == req.type) {
+        resume_thread = req.target;
+      } else if (ok && DREQ_SET_QUERY_THREAD == req.type) {
+        query_thread = req.target;
+      }
+      val_reply_select_thread = ok;
+
+    }
     PASSTHROUGH_REF(reply_get_thread_extra_info, std::string, const std::string&); 
     PASSTHROUGH_REF(reply_get_reg, GdbRegisterValue, const GdbRegisterValue&);
     PASSTHROUGH_REF(reply_get_exec_file, std::string, const std::string&);
@@ -88,9 +109,12 @@ class PassthroughGdbConnection : public GdbConnection {
     void clear_pass_signals(){
       pass_signals.clear();
     }
+    
+    int val_notify_stop_sig = 0;
+    const std::string* val_notify_stop_reason;
     void notify_stop(GdbThreadId which, int sig, const char *reason=nullptr) override {
-      std::cout<<"notify_stop called. " << std::endl;
-
+       /* std::cout<<"notify_stop called with "<<sig<< "and reason: " << reason << std::endl; */ 
+      val_notify_stop_sig = sig;
     }
     
     bool sniff_packet() override {
