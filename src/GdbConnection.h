@@ -364,13 +364,13 @@ public:
    * request, but the target is dead.  This situation is a symptom of a
    * gdb or rr bug.
    */
-  void notify_no_such_thread(const GdbRequest& req);
+  virtual void notify_no_such_thread(const GdbRequest& req);
 
   /**
    * Finish a DREQ_RESTART request.  Should be invoked after replay
    * restarts and prior GdbConnection has been restored.
    */
-  void notify_restart();
+  virtual void notify_restart();
 
   /**
    * Return the current request made by the debugger host, that needs to
@@ -608,7 +608,6 @@ public:
 
   bool is_pass_signal(int sig);
 
-protected:
   /**
    * read() incoming data exactly one time, successfully.  May block.
    */
@@ -672,9 +671,9 @@ protected:
    * Return true if we need to do something in a debugger request,
    * false if we already handled the packet internally.
    */
-  bool process_packet();
-  void consume_request();
-  void send_stop_reply_packet(GdbThreadId thread, int sig,
+  virtual bool process_packet();
+  virtual void consume_request();
+  virtual void send_stop_reply_packet(GdbThreadId thread, int sig,
                               const char *reason);
   void send_file_error_reply(int system_errno);
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "GdbConnection.h"
+#include <cstdint>
 #include <iostream>
 #include <sys/types.h>
 #include "GdbServer.h"
@@ -57,14 +58,24 @@ public:
   GdbThreadId get_current_thread() const;
   /* std::string exec_file; */
 
+  bool continue_or_s = true;
   GdbRequest last_debugger_request_result;
   GdbRequest last_resume_request;
   ContinueOrStop continue_or_stop;
   GdbRequest process_debugger_requests(ReportState state = REPORT_NORMAL) override;
   GdbRequest placeholder_process_debugger_requests(ReportState state = REPORT_NORMAL);
 
+  bool internal_restart(GdbRestartType type, int64_t param);
+  bool restart_from_previous();
+  bool restart_from_event(int64_t event);
+  bool restart_from_ticks(int64_t ticks);
+  bool restart_from_checkpoint(int64_t checkpoint);
+
+  bool has_exited() const;
+  int get_exit_code() const;
   void add_pass_signal(int32_t signal);
   void clear_pass_signals();
+  bool can_continue() const;
   std::vector<GdbRegisterValue> result_get_regs;
   const std::vector<GdbRegisterValue>& get_regs() const;
   const GdbRegisterValue& get_register(GdbRegister reg_name, GdbThreadId query_thread) const;
@@ -74,8 +85,8 @@ public:
   
   void setfs_pid(int64_t pid);
 
-  bool continue_forward(GdbContAction action);
-  bool continue_backward(GdbContAction action);
+  int32_t continue_forward(GdbContAction action);
+  int32_t continue_backward(GdbContAction action);
   std::vector<GdbThreadId> get_thread_list() const;
   const std::string& get_thread_extra_info(GdbThreadId target) const;
   bool set_sw_breakpoint(uintptr_t addr, int32_t kind);
@@ -83,6 +94,7 @@ public:
   bool set_hw_breakpoint(uintptr_t addr, int32_t kind);
   bool set_breakpoint(GdbRequestType type, uintptr_t addr, int32_t kind, std::vector<std::vector<uint8_t>> conditions);
   const std::vector<uint8_t>& get_auxv(GdbThreadId query_thread) const;
+  const std::vector<uint8_t>& get_mem(uintptr_t addr, uintptr_t length) const;
   bool has_breakpoint_at_address(GdbThreadId tuid, uintptr_t addr) const;
 
 

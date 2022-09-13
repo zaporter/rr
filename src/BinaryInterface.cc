@@ -1,37 +1,4 @@
 #include "BinaryInterface.h"
-/* #include <iostream> */
-/* #include <memory> */
-/* #include <unistd.h> */
-/* #include "util.h" */
-/* #include "core.h" */
-/* #include "main.h" */
-
-
-
-/* #include "Command.h" */
-/* #include "Flags.h" */
-/* #include "GdbServer.h" */
-/* #include "ReplaySession.h" */
-/* #include "core.h" */
-/* #include <memory> */
-/* #include <unistd.h> */
-
-
-
-/* #include <sys/prctl.h> */
-/* #include <sys/time.h> */
-/* #include <sys/wait.h> */
-/* #include <unistd.h> */
-
-/* #include <limits> */
-/* #include <iostream> */
-
-/* #include "Command.h" */
-/* #include "GdbServer.h" */
-/* #include "ReplaySession.h" */
-/* #include "ScopedFd.h" */
-/* #include "kernel_metadata.h" */
-/* #include "log.h" */
 #include "GdbConnection.h"
 #include "ReplayTimeline.h"
 #include "main.h"
@@ -579,6 +546,7 @@ bool BinaryInterface::initialize(){
 PassthroughGdbConnection* run_req(BinaryInterface* me, GdbRequest req){
   GdbConnection* tbase = me->dbg.get();
   PassthroughGdbConnection* passthrough = static_cast<PassthroughGdbConnection*>(tbase);
+
   /* passthrough->set_request(req); */
   /* if (me->is_processing_requests) { */
   /*   me->last_debugger_request_result = me->placeholder_process_debugger_requests(); */
@@ -602,7 +570,7 @@ PassthroughGdbConnection* run_req(BinaryInterface* me, GdbRequest req){
   int num_loops = 0;
   while(!me->is_processing_requests) {
     num_loops++;
-    me->debug_one_step(me->last_resume_request);
+    me->continue_or_s = me->debug_one_step(me->last_resume_request);
     me->last_debugger_request_result = GdbRequest(DREQ_LIBRR_PASSTHROUGH);
   } 
   /* GdbRequest return_request = me->last_debugger_request_result;//me->placeholder_process_debugger_requests(); */
@@ -610,6 +578,7 @@ PassthroughGdbConnection* run_req(BinaryInterface* me, GdbRequest req){
   /*   me->last_debugger_request_result = return_request; */
   /*   me->continue_or_stop = me->debug_one_step(me->last_resume_request); */
   /* } */
+  assert(passthrough->has_new_val);
   return passthrough;
 }
 
@@ -619,6 +588,9 @@ const std::string& BinaryInterface::get_exec_file() const{
   Task* t = me->timeline.current_session().current_task();
   req.target.pid = req.target.tid = t->tuid().tid();
   return run_req(me,req)->val_reply_get_exec_file;
+}
+bool BinaryInterface::can_continue() const {
+  return continue_or_s;
 }
 
 GdbThreadId BinaryInterface::get_current_thread() const{
@@ -637,6 +609,43 @@ void BinaryInterface::clear_pass_signals(){
   GdbConnection* tbase = dbg.get();
   PassthroughGdbConnection* passthrough = static_cast<PassthroughGdbConnection*>(tbase);
   passthrough->clear_pass_signals();
+}
+bool BinaryInterface::has_exited() const{
+  GdbConnection* tbase = dbg.get();
+  PassthroughGdbConnection* passthrough = static_cast<PassthroughGdbConnection*>(tbase);
+  return passthrough->has_exited;
+}
+
+bool BinaryInterface::internal_restart(GdbRestartType type, int64_t param){
+  GdbConnection* tbase = dbg.get();
+  PassthroughGdbConnection* passthrough = static_cast<PassthroughGdbConnection*>(tbase);
+  passthrough->ran_notify_restart_failed=false;
+  passthrough->ran_notify_restart=false;
+  GdbRequest req = GdbRequest(DREQ_RESTART);
+  req.restart().type = type;
+  req.restart().param = param;
+  run_req(this,req);
+  return !passthrough->ran_notify_restart_failed && 
+    passthrough->ran_notify_restart;
+
+}
+bool BinaryInterface::restart_from_previous(){
+  return internal_restart(RESTART_FROM_PREVIOUS, -1);
+}
+bool BinaryInterface::restart_from_event(int64_t event){
+  return internal_restart(RESTART_FROM_EVENT, event);
+}
+bool BinaryInterface::restart_from_ticks(int64_t ticks){
+  return internal_restart(RESTART_FROM_TICKS, ticks);
+}
+bool BinaryInterface::restart_from_checkpoint(int64_t checkpoint){
+  return internal_restart(RESTART_FROM_CHECKPOINT, checkpoint);
+}
+
+int BinaryInterface::get_exit_code() const {
+  GdbConnection* tbase = dbg.get();
+  PassthroughGdbConnection* passthrough = static_cast<PassthroughGdbConnection*>(tbase);
+  return passthrough->exit_code;
 }
 
 const std::string& BinaryInterface::get_thread_extra_info(GdbThreadId target) const{
@@ -738,9 +747,20 @@ const std::vector<uint8_t>& BinaryInterface::get_auxv(GdbThreadId query_thread) 
   GdbRequest req = GdbRequest(DREQ_GET_AUXV);
   return run_req(me, req)->val_reply_get_auxv;
 }
+const std::vector<uint8_t>& BinaryInterface::get_mem(uintptr_t addr, uintptr_t len) const {
+  BinaryInterface* me = const_cast<BinaryInterface*>(this);
+  GdbRequest req = GdbRequest(DREQ_GET_MEM);
+  req.target = dbg->query_thread;
+  req.mem().addr = addr;
+  req.mem().len = len;
+  return run_req(me, req)->val_reply_get_mem;
+}
 
 GdbRequest BinaryInterface::placeholder_process_debugger_requests(ReportState state) {
     GdbRequest req = dbg->get_request();
+    if (req.type==DREQ_NONE){
+      return req;
+    }
     req.suppress_debugger_stop = false;
     try_lazy_reverse_singlesteps(req);
 
@@ -818,7 +838,8 @@ GdbRequest BinaryInterface::placeholder_process_debugger_requests(ReportState st
 //    }
 //
 GdbRequest BinaryInterface::process_debugger_requests(ReportState state) {
-  is_processing_requests = true;
+  last_debugger_request_result = placeholder_process_debugger_requests();
+  is_processing_requests = last_debugger_request_result.type == DREQ_NONE;
   return last_debugger_request_result;
   /* if (!is_processing_requests){ */
   /*   is_processing_requests=false; */
@@ -863,23 +884,21 @@ const GdbRegisterValue& BinaryInterface::get_register(GdbRegister reg_name, GdbT
   req.reg().name = reg_name;
   return run_req(me, req)->val_reply_get_reg;
 }
-bool BinaryInterface::continue_forward(GdbContAction action) {
+int32_t BinaryInterface::continue_forward(GdbContAction action) {
   vector<GdbContAction> actions;
   actions.push_back(action);
   GdbRequest req = GdbRequest(DREQ_CONT);
   req.cont().run_direction = RUN_FORWARD;
   req.cont().actions = move(actions);
-  run_req(this,req);
-  return true;
+  return run_req(this,req)->val_notify_stop_sig;
 }
-bool BinaryInterface::continue_backward(GdbContAction action) {
+int32_t BinaryInterface::continue_backward(GdbContAction action) {
   vector<GdbContAction> actions;
   actions.push_back(action);
   GdbRequest req = GdbRequest(DREQ_CONT);
   req.cont().run_direction = RUN_BACKWARD;
   req.cont().actions = move(actions);
-  run_req(this,req);
-  return true;
+  return run_req(this,req)->val_notify_stop_sig;
 }
 /* rust::String BinaryInterface::get_exec_file(GdbThreadId request_target) const { */
 

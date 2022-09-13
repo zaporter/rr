@@ -216,6 +216,13 @@ const EmergencyDebugOstream& operator<<(const EmergencyDebugOstream& stream,
   } while (0)
 #endif
 
+#define RUNTIME_ASSERT(cond) \
+  do {                     \
+    if (!(cond)) {         \
+      FATAL() << #cond;    \
+    }                      \
+  } while(0)
+
 /**
  * Ensure that |_v| is streamed in hex format.
  * We make sure that signed types are *not* sign-extended.
