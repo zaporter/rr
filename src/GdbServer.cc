@@ -614,11 +614,11 @@ void GdbServer::dispatch_debugger_request(Session& session,
       // memory will be written to an diversion session.
       // Arbitrary writes to replay sessions cause
       // divergence.
-      if (!session.is_diversion()) {
-        LOG(error) << "Attempt to write memory outside diversion session";
-        dbg->reply_set_mem(false);
-        return;
-      }
+      /* if (!session.is_diversion()) { */
+      /*   LOG(error) << "Attempt to write memory outside diversion session"; */
+      /*   dbg->reply_set_mem(false); */
+      /*   return; */
+      /* } */
       LOG(debug) << "Writing " << req.mem().len << " bytes to "
                  << HEX(req.mem().addr);
       // TODO fallible

@@ -840,6 +840,8 @@ public:
   };
 
   void map_rr_page(AutoRemoteSyscalls& remote);
+  void map_heap_page(AutoRemoteSyscalls& remote, remote_ptr<void> page_loc, size_t page_size);
+  void map_stack_page(AutoRemoteSyscalls& remote, remote_ptr<void> page_loc, size_t page_size);
   void unmap_all_but_rr_page(AutoRemoteSyscalls& remote);
 
   void erase_task(Task* t) {

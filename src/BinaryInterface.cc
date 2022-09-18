@@ -589,6 +589,20 @@ const std::string& BinaryInterface::get_exec_file() const{
   req.target.pid = req.target.tid = t->tuid().tid();
   return run_req(me,req)->val_reply_get_exec_file;
 }
+bool BinaryInterface::mmap_stack(size_t addr, size_t size) {
+  Task* t = this->timeline.current_session().current_task();
+
+  AutoRemoteSyscalls remote(t);
+  t->vm()->map_stack_page(remote, addr, size);
+  return true;
+}
+bool BinaryInterface::mmap_heap(size_t addr, size_t size) {
+  Task* t = this->timeline.current_session().current_task();
+
+  AutoRemoteSyscalls remote(t);
+  t->vm()->map_heap_page(remote, addr, size);
+  return true;
+}
 bool BinaryInterface::can_continue() const {
   return continue_or_s;
 }
@@ -754,6 +768,15 @@ const std::vector<uint8_t>& BinaryInterface::get_mem(uintptr_t addr, uintptr_t l
   req.mem().addr = addr;
   req.mem().len = len;
   return run_req(me, req)->val_reply_get_mem;
+}
+
+bool BinaryInterface::set_byte(uintptr_t addr, uint8_t val){
+  GdbRequest req = GdbRequest(DREQ_SET_MEM);
+  req.target= dbg->query_thread;
+  req.mem().addr = addr;
+  req.mem().len = 1;
+  req.mem().data.push_back(val);
+  return run_req(this, req)->val_reply_set_mem;
 }
 
 GdbRequest BinaryInterface::placeholder_process_debugger_requests(ReportState state) {

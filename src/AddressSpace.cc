@@ -6,6 +6,7 @@
 #include <linux/kdev_t.h>
 #include <linux/prctl.h>
 #include <sys/stat.h>
+#include <iostream>
 #include <unistd.h>
 
 #include <limits>
@@ -348,6 +349,39 @@ void AddressSpace::map_rr_page(AutoRemoteSyscalls& remote) {
       TRACED, UNPRIVILEGED, RECORDING_AND_REPLAY, t->arch());
   privileged_traced_syscall_ip_ = rr_page_syscall_entry_point(
       TRACED, PRIVILEGED, RECORDING_AND_REPLAY, t->arch());
+}
+
+void AddressSpace::map_stack_page(AutoRemoteSyscalls& remote, remote_ptr<void> page_loc, size_t page_size) {
+  int prot = PROT_WRITE | PROT_READ;
+  int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_GROWSDOWN;
+
+  Task* t = remote.task();
+  SupportedArch arch = t->arch();
+
+  size_t offset_bytes = 0;
+
+  int child_fd=-1;
+  remote.infallible_mmap_syscall_if_alive(page_loc, page_size, prot, flags,
+                                          child_fd, offset_bytes);
+
+  map(t, page_loc, page_size, prot, flags,
+      offset_bytes, "[stack]");
+}
+void AddressSpace::map_heap_page(AutoRemoteSyscalls& remote, remote_ptr<void> page_loc, size_t page_size) {
+  int prot = PROT_EXEC | PROT_WRITE | PROT_READ;
+  int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+
+  Task* t = remote.task();
+  SupportedArch arch = t->arch();
+
+  size_t offset_bytes = 0;
+
+  int child_fd=-1;
+  remote.infallible_mmap_syscall_if_alive(page_loc, page_size, prot, flags,
+                                          child_fd, offset_bytes);
+
+  map(t, page_loc, page_size, prot, flags,
+      offset_bytes, "[heap]");
 }
 
 void AddressSpace::unmap_all_but_rr_page(AutoRemoteSyscalls& remote) {
@@ -2052,6 +2086,7 @@ void AddressSpace::map_and_coalesce(
     EmuFile::shr_ptr emu_file, unique_ptr<struct stat> mapped_file_stat,
     void* local_addr, shared_ptr<MonitoredSharedMemory>&& monitored) {
   LOG(debug) << "  mapping " << m;
+  std::cout<< "MAPPING" << m << std::endl;
 
   if (monitored) {
     monitored_mem.insert(m.start());

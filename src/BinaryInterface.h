@@ -10,6 +10,7 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "AutoRemoteSyscalls.h"
 
 #include <limits>
 #include "ReplaySession.h"
@@ -76,6 +77,8 @@ public:
   void add_pass_signal(int32_t signal);
   void clear_pass_signals();
   bool can_continue() const;
+
+
   std::vector<GdbRegisterValue> result_get_regs;
   const std::vector<GdbRegisterValue>& get_regs() const;
   const GdbRegisterValue& get_register(GdbRegister reg_name, GdbThreadId query_thread) const;
@@ -84,6 +87,8 @@ public:
   bool set_symbol(const std::string& name, uintptr_t address);
   
   void setfs_pid(int64_t pid);
+  bool mmap_stack(size_t addr, size_t size);
+  bool mmap_heap(size_t addr, size_t size);
 
   int32_t continue_forward(GdbContAction action);
   int32_t continue_backward(GdbContAction action);
@@ -94,6 +99,9 @@ public:
   bool set_hw_breakpoint(uintptr_t addr, int32_t kind);
   bool set_breakpoint(GdbRequestType type, uintptr_t addr, int32_t kind, std::vector<std::vector<uint8_t>> conditions);
   const std::vector<uint8_t>& get_auxv(GdbThreadId query_thread) const;
+
+  bool set_byte(uintptr_t addr, uint8_t val);
+
   const std::vector<uint8_t>& get_mem(uintptr_t addr, uintptr_t length) const;
   bool has_breakpoint_at_address(GdbThreadId tuid, uintptr_t addr) const;
 

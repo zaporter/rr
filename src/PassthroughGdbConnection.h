@@ -18,7 +18,7 @@
     val_ ## name = val; \
     consume_request(); \
   }
-#define PASSTHROUGH_BOOL(name) bool ran_ ## name; \
+#define PASSTHROUGH_RAN(name) bool ran_ ## name; \
   void name () override { \
     ran_ ## name = true; \
     consume_request(); \
@@ -158,8 +158,9 @@ class PassthroughGdbConnection : public GdbConnection {
       has_new_val=true;
       consume_request();
     };
-    PASSTHROUGH_BOOL(notify_restart_failed);
-    PASSTHROUGH_BOOL(notify_restart);
+    PASSTHROUGH_RAN(notify_restart_failed);
+    PASSTHROUGH_RAN(notify_restart);
+    PASSTHROUGH(reply_set_mem, bool);
     PASSTHROUGH(reply_get_current_thread, GdbThreadId);
     PASSTHROUGH(reply_watchpoint_request, bool);
 
