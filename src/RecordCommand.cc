@@ -6,8 +6,16 @@
 #include <spawn.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
+#include <iostream>
 #include <sysexits.h>
 #include <time.h>
+#include <iterator>
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <sstream>
+#include <iterator>
+#include "RecordTask.h"
 
 #include "preload/preload_interface.h"
 
@@ -677,7 +685,10 @@ static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
   bool did_forward_SIGTERM = false;
   bool did_term_detached_tasks = false;
   pthread_t term_repeater_thread;
+  std::cout<<"START_LOOP"<<std::endl;
+  int i = 0;
   do {
+      std::cout<<"LOOP_DONE "<< i++ <<std::endl;
     bool done_initial_exec = session->done_initial_exec();
     step_result = session->record_step();
     // Only create latest-trace symlink if --output-trace-dir is not being used
@@ -865,6 +876,123 @@ int RecordCommand::run(vector<string>& args) {
   }
   return 1;
 
+}
+
+
+// RECORDING INTERFACE 
+//
+RecordingInterface::RecordingInterface(std::shared_ptr<rr::RecordSession> session, std::string output_trace_dir):
+    session(session),
+    did_forward_SIGTERM(false),
+    did_term_detached_tasks(false),
+    output_trace_dir(output_trace_dir)
+{
+
+};
+bool RecordingInterface::continue_recording() {
+    bool done_initial_exec = session->done_initial_exec();
+    step_result = session->record_step();
+    // Only create latest-trace symlink if --output-trace-dir is not being used
+    if (!done_initial_exec && session->done_initial_exec() && output_trace_dir.empty()) {
+      session->trace_writer().make_latest_trace();
+    }
+    if (term_requested) {
+      if (monotonic_now_sec() - term_requested > TRACEE_SIGTERM_RESPONSE_MAX_TIME) {
+        /* time ran out for the tracee to respond to SIGTERM; kill everything */
+        session->terminate_tracees();
+      } else if (!did_forward_SIGTERM) {
+        session->forward_SIGTERM();
+        // Start a thread to send a SIGTERM to ourselves (again)
+        // in case the tracee doesn't respond to SIGTERM.
+        pthread_create(&term_repeater_thread, NULL, repeat_SIGTERM, NULL);
+        did_forward_SIGTERM = true;
+      }
+      /* Forward SIGTERM to detached tasks immediately */
+      if (!did_term_detached_tasks) {
+        session->term_detached_tasks();
+        did_term_detached_tasks = true;
+      }
+    }
+    bool should_continue = step_result.status == RecordSession::STEP_CONTINUE;
+    if (!should_continue) {
+      session->close_trace_writer(TraceWriter::CLOSE_OK);
+    }
+    return should_continue;
+}
+
+int64_t RecordingInterface::current_frame_time() const{
+    /* return session->scheduler().current()->trace_time(); */
+    return session->trace_writer().time();
+}
+
+std::unique_ptr<RecordingInterface> new_recording_interface(const std::string& args_str){
+  std::stringstream ss(args_str);
+  std::istream_iterator<std::string> begin(ss);
+  std::istream_iterator<std::string> end;
+  std::vector<std::string> args(begin, end);
+
+  RecordFlags flags;
+  while (parse_record_arg(args, flags)) {
+  }
+
+  if (running_under_rr()) {
+      //TODO ZACK: Error properly 
+  }
+ // TODO ZACK: Proper error reporting
+ // if (!Command::verify_not_option(args) || args.size() == 0) {
+ //   RecordCommand::singleton.print_help(stderr);
+ //   return 1;
+//}
+
+  assert_prerequisites(flags.use_syscall_buffer);
+
+  if (flags.setuid_sudo) {
+    if (geteuid() != 0 || getenv("SUDO_UID") == NULL) {
+      fprintf(stderr, "rr: --setuid-sudo option may only be used under sudo.\n"
+                      "Re-run as `sudo -EP --preserve-env=HOME rr record --setuid-sudo` to"
+                      "record privileged executables.\n");
+      //TODO ZACK: Error properly 
+    }
+    reset_uid_sudo();
+  }
+
+  if (flags.chaos) {
+    // Add up to one page worth of random padding to the environment to induce
+    // a variety of possible stack pointer offsets
+    vector<char> chars;
+    chars.resize(random() % page_size());
+    memset(chars.data(), '0', chars.size());
+    chars.push_back(0);
+    string padding = string("RR_CHAOS_PADDING=") + chars.data();
+    flags.extra_env.push_back(padding);
+  }
+
+  // RECORD()
+  
+  auto session = RecordSession::create(
+      args, flags.extra_env, flags.disable_cpuid_features,
+      flags.use_syscall_buffer, flags.syscallbuf_desched_sig,
+      flags.bind_cpu, flags.output_trace_dir,
+      flags.trace_id.get(),
+      flags.stap_sdt, flags.unmap_vdso, flags.asan, flags.tsan);
+
+  if (flags.print_trace_dir >= 0) {
+    const string& dir = session->trace_writer().dir();
+    write_all(flags.print_trace_dir, dir.c_str(), dir.size());
+    write_all(flags.print_trace_dir, "\n", 1);
+  }
+
+  if (flags.copy_preload_src) {
+    const string& dir = session->trace_writer().dir();
+    copy_preload_sources_to_trace(dir);
+    save_rr_git_revision(dir);
+  }
+
+  // Install signal handlers after creating the session, to ensure they're not
+  // inherited by the tracee.
+  install_signal_handlers();
+
+  return std::unique_ptr<RecordingInterface>(new RecordingInterface(session, flags.output_trace_dir));
 }
 
 } // namespace rr

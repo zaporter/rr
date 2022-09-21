@@ -2086,7 +2086,6 @@ void AddressSpace::map_and_coalesce(
     EmuFile::shr_ptr emu_file, unique_ptr<struct stat> mapped_file_stat,
     void* local_addr, shared_ptr<MonitoredSharedMemory>&& monitored) {
   LOG(debug) << "  mapping " << m;
-  std::cout<< "MAPPING" << m << std::endl;
 
   if (monitored) {
     monitored_mem.insert(m.start());
