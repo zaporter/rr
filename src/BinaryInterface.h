@@ -91,6 +91,7 @@ public:
   bool mmap_heap(size_t addr, size_t size);
 
   int32_t continue_forward(GdbContAction action);
+  int32_t continue_forward_jog_undefined(GdbContAction action);
   int32_t continue_backward(GdbContAction action);
   std::vector<GdbThreadId> get_thread_list() const;
   const std::string& get_thread_extra_info(GdbThreadId target) const;

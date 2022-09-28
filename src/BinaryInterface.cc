@@ -543,25 +543,13 @@ bool BinaryInterface::initialize(){
 //      last_response = resp;
 //      debug_one_step();
 //    }
-PassthroughGdbConnection* run_req(BinaryInterface* me, GdbRequest req){
+//
+//    debug_at_most_times is set to 2^29. If we are going over this number of times, there is almost certainly a bug
+PassthroughGdbConnection* run_req(BinaryInterface* me, GdbRequest req, uint32_t debug_at_most_times=536870912){
+  
   GdbConnection* tbase = me->dbg.get();
   PassthroughGdbConnection* passthrough = static_cast<PassthroughGdbConnection*>(tbase);
 
-  /* passthrough->set_request(req); */
-  /* if (me->is_processing_requests) { */
-  /*   me->last_debugger_request_result = me->placeholder_process_debugger_requests(); */
-  /*   if (me->last_debugger_request_result.type == DREQ_LIBRR_PASSTHROUGH){ */
-  /*     do { */
-  /*       me->debug_one_step(me->last_resume_request); */
-  /*     } while (!me->is_processing_requests); */
-  /*   } */
-    
-  /* }else{ */
-  /*     do { */
-  /*       me->debug_one_step(me->last_resume_request); */
-  /*     } while (!me->is_processing_requests); */
-  /*   /1* me->debug_one_step(me->last_resume_request); *1/ */
-  /* } */
   passthrough->set_request(req);
   me->last_debugger_request_result = me->placeholder_process_debugger_requests();
   if (me->last_debugger_request_result.type != DREQ_LIBRR_PASSTHROUGH){
@@ -572,12 +560,19 @@ PassthroughGdbConnection* run_req(BinaryInterface* me, GdbRequest req){
     num_loops++;
     me->continue_or_s = me->debug_one_step(me->last_resume_request);
     me->last_debugger_request_result = GdbRequest(DREQ_LIBRR_PASSTHROUGH);
+    if (num_loops >= debug_at_most_times && !passthrough->has_new_val && !me->is_processing_requests) {
+      // If we are over and about to go again, skip it
+      // If we are at the maximum then throw an exception. 
+      // Probably infinite loop
+      if (debug_at_most_times==536870912){
+        throw 0;
+      }
+      me->is_processing_requests=true;
+      passthrough->consume_request();
+      passthrough->val_notify_stop_sig = -1;
+    }
   } 
-  /* GdbRequest return_request = me->last_debugger_request_result;//me->placeholder_process_debugger_requests(); */
-  /* if (return_request.type != DREQ_LIBRR_PASSTHROUGH){ */
-  /*   me->last_debugger_request_result = return_request; */
-  /*   me->continue_or_stop = me->debug_one_step(me->last_resume_request); */
-  /* } */
+
   assert(passthrough->has_new_val);
   return passthrough;
 }
@@ -914,6 +909,14 @@ int32_t BinaryInterface::continue_forward(GdbContAction action) {
   req.cont().run_direction = RUN_FORWARD;
   req.cont().actions = move(actions);
   return run_req(this,req)->val_notify_stop_sig;
+}
+int32_t BinaryInterface::continue_forward_jog_undefined(GdbContAction action) {
+  vector<GdbContAction> actions;
+  actions.push_back(action);
+  GdbRequest req = GdbRequest(DREQ_CONT);
+  req.cont().run_direction = RUN_FORWARD;
+  req.cont().actions = move(actions);
+  return run_req(this,req,2)->val_notify_stop_sig;
 }
 int32_t BinaryInterface::continue_backward(GdbContAction action) {
   vector<GdbContAction> actions;
