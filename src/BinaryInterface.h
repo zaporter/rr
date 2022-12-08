@@ -45,6 +45,7 @@ public:
       /* s.serve_replay(conn_flags); */
   };
 
+  std::string debugger_launch_command;
   bool initialize();
   bool is_processing_requests;
   int64_t current_frame_time() const;
@@ -71,6 +72,8 @@ public:
   bool restart_from_event(int64_t event);
   bool restart_from_ticks(int64_t ticks);
   bool restart_from_checkpoint(int64_t checkpoint);
+
+  bool serve_current_state_as_gdbserver(uint16_t des_port);
 
   bool has_exited() const;
   int get_exit_code() const;

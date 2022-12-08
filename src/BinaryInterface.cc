@@ -458,6 +458,96 @@ static remote_ptr<void> base_addr_from_rendezvous(Task* t, string fname)
   }
   return nullptr;
 }
+
+struct DebuggerParams {
+  char exe_image[PATH_MAX];
+  char host[16]; // INET_ADDRSTRLEN, omitted for header churn
+  short port;
+};
+
+static void push_default_gdb_options(vector<string>& vec, bool serve_files) {
+  // The gdb protocol uses the "vRun" packet to reload
+  // remote targets.  The packet is specified to be like
+  // "vCont", in which gdb waits infinitely long for a
+  // stop reply packet.  But in practice, gdb client
+  // expects the vRun to complete within the remote-reply
+  // timeout, after which it issues vCont.  The timeout
+  // causes gdb<-->rr communication to go haywire.
+  //
+  // rr can take a very long time indeed to send the
+  // stop-reply to gdb after restarting replay; the time
+  // to reach a specified execution target is
+  // theoretically unbounded.  Timing out on vRun is
+  // technically a gdb bug, but because the rr replay and
+  // the gdb reload models don't quite match up, we'll
+  // work around it on the rr side by disabling the
+  // remote-reply timeout.
+  vec.push_back("-l");
+  vec.push_back("10000");
+  if (!serve_files) {
+    // For now, avoid requesting binary files through vFile. That is slow and
+    // hard to make work correctly, because gdb requests files based on the
+    // names it sees in memory and in ELF, and those names may be symlinks to
+    // the filenames in the trace, so it's hard to match those names to files in
+    // the trace.
+    vec.push_back("-ex");
+    vec.push_back("set sysroot /");
+  }
+}
+
+static void push_target_remote_cmd(vector<string>& vec, const string& host,
+                                   unsigned short port) {
+  vec.push_back("-ex");
+  stringstream ss;
+  // If we omit the address, then gdb can try to resolve "localhost" which
+  // in some broken environments may not actually resolve to the local host
+  ss << "target extended-remote " << host << ":" << port;
+  vec.push_back(ss.str());
+}
+
+/**
+ * Wait for exactly one gdb host to connect to this remote target on
+ * the specified IP address |host|, port |port|.  If |probe| is nonzero,
+ * a unique port based on |start_port| will be searched for.  Otherwise,
+ * if |port| is already bound, this function will fail.
+ *
+ * Pass the |tgid| of the task on which this debug-connection request
+ * is being made.  The remaining debugging session will be limited to
+ * traffic regarding |tgid|, but clients don't need to and shouldn't
+ * need to assume that.
+ *
+ * If we're opening this connection on behalf of a known client, pass
+ * an fd in |client_params_fd|; we'll write the allocated port and |exe_image|
+ * through the fd before waiting for a connection. |exe_image| is the
+ * process that will be debugged by client, or null ptr if there isn't
+ * a client.
+ *
+ * This function is infallible: either it will return a valid
+ * debugging context, or it won't return.
+ */
+static unique_ptr<GdbConnection> await_connection(
+    Task* t, ScopedFd& listen_fd, const GdbConnection::Features& features) {
+  auto dbg = unique_ptr<GdbConnection>(new GdbConnection(t->tgid(), features));
+  dbg->set_cpu_features(get_cpu_features(t->arch()));
+  dbg->await_debugger(listen_fd);
+  return dbg;
+}
+
+static void print_debugger_launch_command(Task* t, const string& host,
+                                          unsigned short port,
+                                          bool serve_files,
+                                          const char* debugger_name,
+                                          FILE* out) {
+  vector<string> options;
+  push_default_gdb_options(options, serve_files);
+  push_target_remote_cmd(options, host, port);
+  fprintf(out, "%s ", debugger_name);
+  for (auto& opt : options) {
+    fprintf(out, "'%s' ", opt.c_str());
+  }
+  fprintf(out, "%s\n", t->vm()->exe_image().c_str());
+}
+
 // ------------------------------------------------------
 // END PASTE FROM GdbServer.cc
 // ------------------------------------------------------
@@ -633,11 +723,55 @@ bool BinaryInterface::internal_restart(GdbRestartType type, int64_t param){
   GdbRequest req = GdbRequest(DREQ_RESTART);
   req.restart().type = type;
   req.restart().param = param;
-  run_req(this,req);
+  run_req(this,req, 50);
   return !passthrough->ran_notify_restart_failed && 
     passthrough->ran_notify_restart;
+}
+
+bool BinaryInterface::serve_current_state_as_gdbserver(uint16_t des_port) {
+  ConnectionFlags flags;
+  flags.dbg_port = des_port;
+  ReplayResult result;
+  /* while (!at_target(result)){ */
+  /*   result = timeline.replay_step_forward(RUN_CONTINUE); */
+  /*   if (result.status == REPLAY_EXITED) { */
+  /*     LOG(info) << "Debugger was not launched before end of trace"; */
+  /*     return false; */
+  /*   } */
+  /*   std::cout << "Stepped" << std::endl; */
+  /* } */ 
+
+  unsigned short port = flags.dbg_port > 0 ? flags.dbg_port : getpid();
+  // Don't probe if the user specified a port.  Explicitly
+  // selecting a port is usually done by scripts, which would
+  // presumably break if a different port were to be selected by
+  // rr (otherwise why would they specify a port in the first
+  // place).  So fail with a clearer error message.
+  auto probe = flags.dbg_port > 0 ? DONT_PROBE : PROBE_PORT;
+  Task* t = timeline.current_session().current_task();
+  ScopedFd listen_fd = open_socket(flags.dbg_host.c_str(), &port, probe);
+  fputs("Launch gdb with\n  ", stderr);
+  print_debugger_launch_command(t, flags.dbg_host, port, flags.serve_files,
+                                flags.debugger_name.c_str(), stderr);
+  debuggee_tguid = t->thread_group()->tguid();
+
+  do {
+    LOG(debug) << "initializing debugger connection";
+    dbg = await_connection(t, listen_fd, GdbConnection::Features());
+    activate_debugger();
+
+    GdbRequest last_resume_request;
+    while (debug_one_step(last_resume_request) == CONTINUE_DEBUGGING) {
+    }
+
+    //timeline.remove_breakpoints_and_watchpoints();
+  } while (false);
+
+  LOG(debug) << "debugger server exiting ...";
+  return true;
 
 }
+
 bool BinaryInterface::restart_from_previous(){
   return internal_restart(RESTART_FROM_PREVIOUS, -1);
 }
